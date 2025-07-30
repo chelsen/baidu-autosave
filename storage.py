@@ -37,7 +37,7 @@ class BaiduStorage:
                     config['baidu']['tasks'] = []
                 if 'cron' not in config:
                     config['cron'] = {
-                        'default_schedule': '*/5 * * * *',
+                        'default_schedule': '0 8,18,20 * * *',
                         'auto_install': True
                     }
                 # 添加 auth 配置结构
@@ -56,7 +56,7 @@ class BaiduStorage:
                     'tasks': []
                 },
                 'cron': {
-                    'default_schedule': '*/5 * * * *',
+                    'default_schedule': '0 8,18,20 * * *',
                     'auto_install': True
                 },
                 'auth': {
@@ -1125,8 +1125,16 @@ class BaiduStorage:
             else:
                 logger.error(f"子目录内容格式错误: {type(sub_paths)}")
                 return files
-                
+
+            pattern = re.compile(r'关注|加入|新浪|防走丢|资源说明|资源汇总|资源大汇总|学习考证|公众号|汇总|电视剧合集|持续更新|禁商用|美剧整合', re.IGNORECASE)
+            # 不以 mp4|mkv|mp3 结尾的推广文件忽略
+            # pattern = re.compile(r'^(?!.*\.(?:mp4|mkv|mp3)$)(?=.*(?:资源|公众号|汇总|电视剧合集|持续更新|霸王龙|禁商用|美剧整合)).*$', re.IGNORECASE)
+
             for sub_file in sub_files:
+                if pattern.search(sub_file.path):
+                    logger.warning(f"忽略推广文件: {sub_file.path}")
+                    continue
+
                 if hasattr(sub_file, '_asdict'):
                     sub_file_dict = sub_file._asdict()
                 else:

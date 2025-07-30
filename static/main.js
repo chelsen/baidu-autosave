@@ -613,7 +613,7 @@ function renderConfig() {
     
     // 如果没有任何规则，使用默认值
     if (cronRules.length === 0) {
-        cronRules.push('*/5 * * * *');  // 使用配置模板中的默认值
+        cronRules.push('0 8,18,20 * * *');  // 使用配置模板中的默认值
     }
     
     // 设置输入框的值

@@ -150,7 +150,7 @@ class TaskScheduler:
                 return
             
             # 获取默认调度并处理多个cron表达式
-            default_schedule = self.storage.config.get('cron', {}).get('default_schedule', '*/5 * * * *')
+            default_schedule = self.storage.config.get('cron', {}).get('default_schedule', '0 8,18,20 * * *')
             
             # 处理默认调度配置
             cron_expressions = []
