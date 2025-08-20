@@ -15,7 +15,7 @@
     <title>百度网盘自动转存工具</title>
     <!-- Material Icons -->
     <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+    <script src="/static/sortable.min.js"></script>
     <!-- 引入本地资源 -->
     <link rel="stylesheet" href="/static/style.css">
     <script src="/static/main.js" defer></script>
@@ -147,6 +147,15 @@
                             <label for="notify-enabled">启用通知</label>
                         </div>
                         
+                        <div class="input-group">
+                            <label for="notification-delay">通知延迟时间 (秒)</label>
+                            <input type="number" id="notification-delay" name="notification-delay" 
+                                   min="0" max="300" value="30" placeholder="多个任务在此时间内完成将合并通知">
+                            <div class="help-text">
+                                设置通知延迟合并时间，当多个任务在此时间内执行完成时，将合并为一条通知发送
+                            </div>
+                        </div>
+                        
                         <!-- 动态通知字段 -->
                         <div id="notify-fields-container">
                             <!-- 这里会动态添加通知字段 -->
@@ -162,6 +171,9 @@
                             </button>
                             <button type="button" id="add-bark-btn" class="secondary small-btn">
                                 添加BARK_PUSH
+                            </button>
+                            <button type="button" id="add-webhook-btn" class="secondary small-btn">
+                                添加WEBHOOK配置
                             </button>
                         </div>
                         
@@ -179,6 +191,8 @@
                                 PUSH_PLUS_TOKEN - PushPlus的令牌<br/>
                                 PUSH_PLUS_USER - PushPlus的群组编码<br/>
                                 BARK_PUSH - Bark推送的令牌<br/>
+                                WEBHOOK相关 - 自定义Webhook通知配置<br/>
+                                * WEBHOOK_BODY支持简化输入: title: "$title"content: "$content"source: "项目名" (保存时自动转换为多行格式)<br/>
                                 更多字段请参考通知模块文档
                             </div>
                         </div>
@@ -202,6 +216,84 @@
                                 */30 * * * * - 每30分钟执行一次<br>
                                 多个规则之间使用分号(;)分隔
                             </div>
+                        </div>
+                    </div>
+
+                    <!-- 网盘容量提醒设置 -->
+                    <div class="form-group">
+                        <h3>网盘容量提醒</h3>
+                        <div class="checkbox-wrapper">
+                            <input type="checkbox" id="quota-alert-enabled" name="quota-alert-enabled">
+                            <label for="quota-alert-enabled">启用容量提醒</label>
+                        </div>
+                        <div class="input-group">
+                            <label for="quota-threshold">容量提醒比例 (%)</label>
+                            <input type="number" id="quota-threshold" name="quota-threshold" 
+                                   min="1" max="99" value="90" placeholder="当使用量超过此比例时发送通知">
+                            <div class="help-text">
+                                当网盘使用容量超过总容量的设定比例时，系统将发送通知提醒
+                            </div>
+                        </div>
+                        <div class="input-group">
+                            <label for="quota-check-schedule">检查时间</label>
+                            <input type="text" id="quota-check-schedule" name="quota-check-schedule" 
+                                   placeholder="cron表达式，默认每天00:00" value="0 0 * * *">
+                            <div class="help-text">
+                                使用cron表达式设置检查时间，默认为每天00:00（0 0 * * *）
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- 分享设置 -->
+                    <div class="form-group">
+                        <h3>分享设置</h3>
+                        <div class="input-group">
+                            <label for="default-share-password">默认分享密码</label>
+                            <input type="text" id="default-share-password" name="default-share-password" 
+                                   maxlength="4" minlength="4" placeholder="请输入4位分享密码" value="1234">
+                            <div class="help-text">
+                                百度网盘分享密码必须是4个字符
+                            </div>
+                        </div>
+                        <div class="input-group">
+                            <label for="default-share-period">默认有效期（天）</label>
+                            <input type="number" id="default-share-period" name="default-share-period" 
+                                   min="0" max="365" value="7" placeholder="分享链接的有效期，单位为天，0表示永久有效">
+                            <div class="help-text">
+                                设置分享链接的默认有效期，单位为天，设置为0表示永久有效
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 文件操作设置 -->
+                    <div class="form-group">
+                        <h3>文件操作设置</h3>
+                        <div class="input-group">
+                            <label for="rename-delay">重命名延迟(秒)</label>
+                            <input type="number" id="rename-delay" name="rename-delay" 
+                                   min="0" max="5" step="0.1" value="0.5"
+                                   placeholder="0.5">
+                            <small class="help-text">
+                                设置文件重命名操作的延迟时间，避免触发API频率限制。推荐值：0.5秒
+                            </small>
+                        </div>
+                        <div class="input-group">
+                            <label for="batch-size">批次大小</label>
+                            <input type="number" id="batch-size" name="batch-size" 
+                                   min="10" max="200" step="10" value="50"
+                                   placeholder="50">
+                            <small class="help-text">
+                                每批次处理的文件数量，较小的批次可以减少出错几率
+                            </small>
+                        </div>
+                        <div class="input-group">
+                            <label for="concurrent-limit">并发限制</label>
+                            <input type="number" id="concurrent-limit" name="concurrent-limit" 
+                                   min="1" max="5" step="1" value="1"
+                                   placeholder="1">
+                            <small class="help-text">
+                                同时处理的任务数量，建议设为1避免冲突
+                            </small>
                         </div>
                     </div>
 
@@ -325,6 +417,18 @@
                     </div>
                     <div class="form-help">可以给任务添加分类标签，方便管理和筛选</div>
                 </div>
+                
+                                <div class="form-group">
+                    <label>过滤表达式</label>
+                    <input type="text" name="regex_pattern" placeholder="如：^(\d+)\.mp4$" title="用于匹配需要转存的文件，留空表示不过滤">
+                </div>
+                
+                <div class="form-group">
+                    <label>重命名表达式</label>
+                    <input type="text" name="regex_replace" placeholder="如：第\1集.mp4" title="用于重命名文件，留空表示不重命名">
+                    <div class="form-help error">提示：百度网盘 API 对重命名操作有严格的频率限制，频繁重命名可能失败或触发风控。不建议启用重命名，优先通过分享源文件名满足需求。</div>
+                </div>
+
                 
                 <div class="form-actions">
                     <button type="button" class="btn secondary" onclick="hideModal('task-modal')">取消</button>

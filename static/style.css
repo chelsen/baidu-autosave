@@ -734,6 +734,7 @@ body {
     display: flex;
     flex-direction: column;
     gap: 8px;
+    max-width: 400px;
 }
 
 .notification {
@@ -743,6 +744,7 @@ body {
     font-size: 14px;
     box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     animation: slideIn 0.3s ease-out;
+    width: 100%;
 }
 
 .notification.info {
@@ -763,6 +765,34 @@ body {
 
 .notification.fade-out {
     animation: fadeOut 0.3s ease-in forwards;
+}
+
+/* 更新通知样式 */
+.update-notification {
+    background-color: white;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 16px;
+    box-shadow: var(--shadow-medium);
+    color: var(--text-primary);
+    width: 100%;
+}
+
+.update-notification strong {
+    display: block;
+    font-size: 16px;
+    margin-bottom: 8px;
+    color: var(--primary-color);
+}
+
+.update-notification p {
+    margin: 4px 0;
+    font-size: 14px;
+}
+
+.update-notification a.btn {
+    margin-top: 12px;
+    display: inline-block;
 }
 
 @keyframes slideIn {
@@ -1302,6 +1332,11 @@ input[list]::placeholder {
     color: var(--text-secondary);
     margin-top: 4px;
     line-height: 1.4;
+}
+
+/* 表单警告/错误帮助文本（红色） */
+.form-help.error {
+    color: var(--error-color);
 }
 
 /* 面板头部样式 */
@@ -2001,10 +2036,6 @@ textarea:focus {
     background: #999;
 }
 
-.task-message.error {
-    color: #ff4d4f;
-}
-
 /* 添加安全区域适配 */
 @supports (padding: max(0px)) {
     .bottom-nav {
@@ -2278,6 +2309,49 @@ textarea:focus {
     text-overflow: ellipsis;
 }
 
+/* 任务消息样式 */
+.task-message {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: #666;
+    line-height: 1.4;
+}
+
+.task-message.error {
+    color: #ff4d4f;
+}
+
+/* 复制按钮样式 */
+.copy-btn {
+    background: none;
+    border: none;
+    padding: 2px;
+    cursor: pointer;
+    color: #666;
+    border-radius: 4px;
+    transition: all 0.2s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    height: 24px;
+}
+
+.copy-btn:hover {
+    background-color: #f0f0f0;
+    color: var(--primary-color);
+}
+
+.copy-btn:active {
+    transform: scale(0.95);
+}
+
+.copy-btn i {
+    font-size: 16px;
+}
+
 /* 移动端任务列表样式调整 */
 @media screen and (max-width: 768px) {
     .task-list {
@@ -2458,4 +2532,89 @@ textarea:focus {
 
 .input-with-dropdown {
     position: relative;
+} 
+
+/* 用户信息样式 */
+#current-user {
+    display: flex;
+    align-items: center;
+    padding: 0 10px;
+    color: #fff;
+    font-size: 14px;
+    cursor: default;
+}
+
+#current-user.logged-in {
+    font-weight: 500;
+}
+
+/* 配额信息样式 */
+.quota-info {
+    margin-left: 10px;
+    padding: 2px 6px;
+    background-color: rgba(255, 255, 255, 0.15);
+    border-radius: 4px;
+    font-size: 12px;
+    color: #fff;
+    white-space: nowrap;
+}
+
+@media (max-width: 768px) {
+    .quota-info {
+        display: none;
+    }
+} 
+
+/* 分享相关样式 */
+.task-share-info {
+    width: 100%;
+    margin-top: 10px;
+    padding: 8px;
+    background-color: #f5f5f5;
+    border-radius: 4px;
+    font-size: 0.9em;
+}
+
+.share-link {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 5px;
+}
+
+.share-link a {
+    color: var(--primary-color);
+    text-decoration: none;
+    word-break: break-all;
+}
+
+.share-password {
+    background-color: #e8f0fe;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-weight: bold;
+}
+
+.share-time {
+    display: flex;
+    gap: 15px;
+    color: var(--text-secondary);
+    font-size: 0.85em;
+}
+
+@media (max-width: 768px) {
+    .share-link {
+        flex-direction: column;
+        gap: 4px;
+    }
+    
+    .share-time {
+        flex-direction: column;
+        gap: 4px;
+    }
+} 
+
+/* 被筛选隐藏的任务 */
+.task-item.filtered-hidden {
+    display: none !important;
 } 

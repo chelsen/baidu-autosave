@@ -1,6 +1,8 @@
 // 应用版本号和配置
-const APP_VERSION = 'v1.0.8';
+const APP_VERSION = 'v1.1.2';
 const GITHUB_REPO = 'kokojacket/baidu-autosave';
+// 版本检测源列表，按优先级排序
+const VERSION_CHECK_SOURCES = ['github', 'dockerhub', 'dockerhub_alt', 'msrun', '1ms'];
 
 // 本地缓存管理
 const CACHE_KEY = {
@@ -9,6 +11,24 @@ const CACHE_KEY = {
     CONFIG: 'baidu_autosave_config',
     HISTORY: 'baidu_autosave_field_history'
 };
+
+// 轮询配置
+const POLLING_CONFIG = {
+    enabled: true,           // 是否启用轮询（默认启用）
+    interval: 5000,          // 轮询间隔（毫秒）
+    taskStatusInterval: 5000, // 任务状态轮询间隔（毫秒）
+    logInterval: 10000,      // 日志轮询间隔（毫秒）
+    retryCount: 3,           // 失败重试次数
+    retryDelay: 3000,        // 重试延迟（毫秒）
+    debug: true              // 是否启用调试日志
+};
+
+// 轮询定时器
+let taskStatusPollingTimer = null;
+let logPollingTimer = null;
+let lastTaskUpdateTime = 0;
+let lastLogUpdateTime = 0;
+let pollingRetryCount = 0;
 
 // 检查是否有异常任务并更新异常按钮的状态
 function updateErrorIndicator() {
@@ -50,12 +70,13 @@ function clearCache() {
 
 // WebSocket配置
 const WS_CONFIG = {
+    enabled: false,          // 是否启用WebSocket（默认禁用）
     maxRetries: 3,           // 最大重试次数
     retryInterval: 5000,     // 初始重试间隔（毫秒）
     reconnectBackoff: 1.5,   // 重试间隔增长系数
     pingInterval: 20000,     // 心跳间隔（毫秒）
     pingTimeout: 8000,       // 心跳超时时间（毫秒）
-    debug: true             // 是否启用调试日志
+    debug: true              // 是否启用调试日志
 };
 
 // 全局状态管理
@@ -198,10 +219,12 @@ function updateTaskStatus(taskId, status, message) {
         const task = state.tasks.find(t => t.order === taskId + 1);
         if (task && task.last_execute_time) {
             const lastExecuteTime = new Date(task.last_execute_time * 1000).toLocaleString();
-            const timeElement = taskElement.querySelector('.last-execute-time') || document.createElement('div');
-            timeElement.className = 'last-execute-time';
-            timeElement.textContent = `上次执行: ${lastExecuteTime}`;
-            taskElement.querySelector('.task-details').appendChild(timeElement);
+            const timeElement = taskElement.querySelector('.last-execute-time');
+            if (timeElement) {
+                // 如果元素已存在，只更新内容
+                timeElement.textContent = `上次执行: ${lastExecuteTime}`;
+            }
+            // 不再创建新元素并添加到末尾
         }
     }
     
@@ -425,6 +448,15 @@ function createTaskElement(task) {
     // 获取显示的消息
     const displayMessage = task.status === 'error' ? (task.error || task.message) : task.message;
     
+    // 生成分享链接展示
+    const shareInfoDisplay = task.share_info ? 
+        `<div class="task-message">
+            分享链接：${task.share_info.url}?pwd=${task.share_info.password}
+            <button class="copy-btn" onclick="copyToClipboard('${task.share_info.url}?pwd=${task.share_info.password}', this)" title="复制链接">
+                <i class="material-icons">content_copy</i>
+            </button>
+        </div>` : '';
+    
     div.innerHTML = `
         <div class="task-item-left">
             <div class="drag-handle" title="拖动排序">
@@ -448,6 +480,7 @@ function createTaskElement(task) {
                 <span class="cron-rule">${task.cron ? `自定义定时：${task.cron}` : `默认定时：${state.config.cron?.default_schedule || '未设置'}`}</span>
                 <div class="last-execute-time">上次执行: ${lastExecuteTime}</div>
                 ${displayMessage ? `<div class="task-message ${task.status === 'error' ? 'error' : ''}">${displayMessage}</div>` : ''}
+                ${shareInfoDisplay}
             </div>
             ${task.status === 'running' ? `
             <div class="progress-bar">
@@ -457,7 +490,7 @@ function createTaskElement(task) {
             </div>
             ` : ''}
         </div>
-        <div class="task-actions" style="min-width: 120px">
+        <div class="task-actions" style="min-width: 160px">
             <button class="btn-icon" onclick="executeTask(${task.order - 1})" 
                     ${task.status === 'running' ? 'disabled' : ''}>
                 <i class="material-icons">play_arrow</i>
@@ -465,6 +498,10 @@ function createTaskElement(task) {
             <button class="btn-icon" onclick="editTask(${task.order - 1})"
                     ${task.status === 'running' ? 'disabled' : ''}>
                 <i class="material-icons">edit</i>
+            </button>
+            <button class="btn-icon" onclick="shareTask(${task.order - 1})"
+                    ${task.status === 'running' ? 'disabled' : ''} title="生成分享链接">
+                <i class="material-icons">share</i>
             </button>
             <button class="btn-icon danger" onclick="deleteTask(${task.order - 1})"
                     ${task.status === 'running' ? 'disabled' : ''}>
@@ -533,8 +570,14 @@ function renderConfig() {
     console.log('开始渲染配置，当前状态:', state);
     
     const notifyEnabled = document.getElementById('notify-enabled');
+    const notificationDelay = document.getElementById('notification-delay');
     const notifyFieldsContainer = document.getElementById('notify-fields-container');
     const globalCron = document.getElementById('global-cron');
+    
+    // 网盘容量提醒配置元素
+    const quotaAlertEnabled = document.getElementById('quota-alert-enabled');
+    const quotaThreshold = document.getElementById('quota-threshold');
+    const quotaCheckSchedule = document.getElementById('quota-check-schedule');
     
     if (!globalCron) {
         console.error('未找到全局定时规则输入框元素');
@@ -545,6 +588,11 @@ function renderConfig() {
     if (state.config.notify) {
         console.log('渲染通知配置:', state.config.notify);
         notifyEnabled.checked = state.config.notify.enabled;
+        
+        // 设置通知延迟时间
+        if (notificationDelay) {
+            notificationDelay.value = state.config.notify.notification_delay || 30;
+        }
         
         // 清空现有字段
         notifyFieldsContainer.innerHTML = '';
@@ -620,7 +668,75 @@ function renderConfig() {
     const cronValue = cronRules.join(';');
     console.log('最终定时规则字符串:', cronValue);
     globalCron.value = cronValue;
+    
+    // 处理网盘容量提醒配置
+    if (state.config.quota_alert) {
+        const quotaAlert = state.config.quota_alert;
+        console.log('渲染网盘容量提醒配置:', quotaAlert);
+        
+        // 设置启用状态
+        if (quotaAlertEnabled) {
+            quotaAlertEnabled.checked = quotaAlert.enabled === true;
+        }
+        
+        // 设置阈值
+        if (quotaThreshold) {
+            quotaThreshold.value = quotaAlert.threshold_percent || 90;
+        }
+        
+        // 设置检查时间
+        if (quotaCheckSchedule) {
+            quotaCheckSchedule.value = quotaAlert.check_schedule || '0 0 * * *';
+        }
+    }
+    
+    // 处理分享配置
+    if (state.config.share) {
+        const shareConfig = state.config.share;
+        console.log('渲染分享配置:', shareConfig);
+        
+        // 设置默认分享密码
+        const defaultSharePassword = document.getElementById('default-share-password');
+        if (defaultSharePassword) {
+            defaultSharePassword.value = shareConfig.default_password || '1234';
+        }
+        
+        // 设置默认有效期
+        const defaultSharePeriod = document.getElementById('default-share-period');
+        if (defaultSharePeriod) {
+            // 确保正确处理0值（永久有效）
+            defaultSharePeriod.value = shareConfig.default_period_days !== undefined ? 
+                shareConfig.default_period_days : 7;
+        }
+    }
+    
+    // 处理文件操作配置
+    if (state.config.file_operations) {
+        const fileOpsConfig = state.config.file_operations;
+        console.log('渲染文件操作配置:', fileOpsConfig);
+        
+        // 设置重命名延迟
+        const renameDelay = document.getElementById('rename-delay');
+        if (renameDelay) {
+            renameDelay.value = fileOpsConfig.rename_delay_seconds !== undefined ? 
+                fileOpsConfig.rename_delay_seconds : 0.5;
+        }
+        
+        // 设置批次大小
+        const batchSize = document.getElementById('batch-size');
+        if (batchSize) {
+            batchSize.value = fileOpsConfig.batch_size || 50;
+        }
+        
+        // 设置并发限制
+        const concurrentLimit = document.getElementById('concurrent-limit');
+        if (concurrentLimit) {
+            concurrentLimit.value = fileOpsConfig.concurrent_limit || 1;
+        }
+    }
 }
+
+// WEBHOOK_BODY字段格式化现在由后端自动处理
 
 // 添加通知字段到UI
 function addNotifyFieldToUI(key, value) {
@@ -641,6 +757,8 @@ function addNotifyFieldToUI(key, value) {
     valueInput.className = 'field-value';
     valueInput.value = value || '';
     valueInput.placeholder = '字段值';
+    
+    // WEBHOOK_BODY字段的格式化在后端保存时自动处理
     
     const deleteBtn = document.createElement('button');
     deleteBtn.type = 'button';
@@ -816,70 +934,83 @@ function clearLog() {
 // 修改任务执行函数
 async function executeTask(taskId) {
     try {
-        // 获取任务的order
-        const task = state.tasks.find(t => t.order === taskId + 1);
+        // 查找任务
+        const task = findTaskById(taskId);
         if (!task) {
-            showError('任务不存在');
-            return;
+            throw new Error('任务不存在或已被删除');
         }
-
-        // 禁用执行按钮
+        
+        // 获取任务元素
         const taskElement = document.querySelector(`.task-item[data-task-id="${taskId}"]`);
-        const executeBtn = taskElement?.querySelector('button[onclick^="executeTask"]');
+        if (!taskElement) {
+            throw new Error('任务元素不存在');
+        }
+        
+        // 禁用执行按钮，防止重复点击
+        const executeBtn = taskElement.querySelector('button[onclick^="executeTask"]');
         if (executeBtn) {
             executeBtn.disabled = true;
         }
         
-        // 清空并显示日志窗口
-        clearLog();
+        // 显示进度模态框
         showModal('progress-modal');
         
-        // 添加初始日志
-        const taskName = task.name || `任务${task.order}`;
-        appendLog(`开始执行任务: ${taskName}`, 'info');
-        appendLog(`分享链接: ${task.url}`, 'info');
-        appendLog(`保存目录: ${task.save_dir}`, 'info');
-        if (task.pwd) {
-            appendLog(`提取码: ${task.pwd}`, 'info');
-        }
+        // 清空日志
+        clearLog();
         
-        // 发送执行请求，使用task_id作为标识
-        const response = await callApi('task/execute', 'POST', { task_id: taskId }, false);
+        // 添加开始执行日志
+        appendLog(`开始执行任务: ${task.name || task.url}`, 'info');
+        
+        // 发送执行请求
+        const response = await callApi(`task/execute`, 'POST', { task_id: taskId });
         
         if (response.success) {
-            // 处理转存文件列表
-            if (response.transferred_files && response.transferred_files.length > 0) {
-                appendLog('\n成功转存以下文件:', 'success');
-                // 按目录分组显示文件
-                const filesByDir = {};
-                response.transferred_files.forEach(file => {
-                    const dir = file.split('/').slice(0, -1).join('/') || '/';
-                    if (!filesByDir[dir]) {
-                        filesByDir[dir] = [];
-                    }
-                    filesByDir[dir].push(file.split('/').pop());
-                });
+            // 使用轮询方式获取进度和状态
+            if (POLLING_CONFIG.enabled) {
+                // 加快轮询频率
+                if (taskStatusPollingTimer) {
+                    clearInterval(taskStatusPollingTimer);
+                    taskStatusPollingTimer = setInterval(pollTaskStatus, 1000); // 每秒轮询一次
+                }
                 
-                // 显示分组后的文件
-                Object.entries(filesByDir).forEach(([dir, files]) => {
-                    appendLog(`\n目录: ${dir}`, 'info');
-                    files.sort().forEach(file => {
-                        appendLog(`  - ${file}`, 'info');
-                    });
-                });
-            } else if (response.message.includes('没有新文件')) {
-                appendLog('\n检查文件更新:', 'info');
-                appendLog('没有发现新文件需要转存', 'warning');
+                // 立即轮询一次
+                await pollTaskStatus();
             }
             
-            appendLog(`\n执行结果: ${response.message}`, 'success');
-            showSuccess(response.message);
+            // 添加执行成功日志
+            if (response.transferred_files && response.transferred_files.length > 0) {
+                appendLog(`\n转存成功，共转存 ${response.transferred_files.length} 个文件:`, 'success');
+                response.transferred_files.forEach(file => {
+                    appendLog(`- ${file}`, 'info');
+                });
+            } else {
+                appendLog(`\n${response.message || '任务执行成功'}`, 'success');
+            }
             
             // 刷新任务列表
             await refreshTasks();
+            
+            // 更新分类
+            await refreshCategories();
+            
+            // 更新任务状态 - 不在这里传递消息参数，避免显示重复通知
+            const updatedTask = findTaskById(taskId);
+            if (updatedTask) {
+                // 更新任务元素状态，但不显示通知
+                updateTaskStatus(taskId, updatedTask.status);
+            }
+            
+            // 显示成功通知
+            showSuccess(response.message || '任务执行成功');
         } else {
-            appendLog(`\n执行失败: ${response.message}`, 'error');
-            showError(response.message);
+            // 添加执行失败日志
+            appendLog(`\n执行失败: ${response.message || '未知错误'}`, 'error');
+            
+            // 刷新任务列表
+            await refreshTasks();
+            
+            // 显示错误通知
+            showError(response.message || '任务执行失败');
         }
     } catch (error) {
         console.error('执行任务失败:', error);
@@ -891,6 +1022,12 @@ async function executeTask(taskId) {
         const executeBtn = taskElement?.querySelector('button[onclick^="executeTask"]');
         if (executeBtn) {
             executeBtn.disabled = false;
+        }
+        
+        // 恢复正常轮询频率
+        if (POLLING_CONFIG.enabled && taskStatusPollingTimer) {
+            clearInterval(taskStatusPollingTimer);
+            taskStatusPollingTimer = setInterval(pollTaskStatus, POLLING_CONFIG.taskStatusInterval);
         }
     }
 }
@@ -925,11 +1062,15 @@ async function editTask(taskId) {
         form.querySelector('[name="save_dir"]').value = task.save_dir || '';
         form.querySelector('[name="cron"]').value = task.cron || '';
         form.querySelector('[name="category"]').value = task.category || '';
+        form.querySelector('[name="regex_pattern"]').value = task.regex_pattern || '';
+        form.querySelector('[name="regex_replace"]').value = task.regex_replace || '';
         
         // 保存字段历史记录
         if (task.save_dir) saveFieldHistory('save_dir', task.save_dir);
         if (task.cron) saveFieldHistory('cron', task.cron);
         if (task.category) saveFieldHistory('category', task.category);
+        if (task.regex_pattern) saveFieldHistory('regex_pattern', task.regex_pattern);
+        if (task.regex_replace) saveFieldHistory('regex_replace', task.regex_replace);
         
         // 显示模态框
         showModal('task-modal');
@@ -938,6 +1079,8 @@ async function editTask(taskId) {
         showError(error.message || '编辑任务失败');
     }
 }
+
+
 
 async function deleteTask(taskId) {
     if (!confirm('确定要删除这个任务吗？')) return;
@@ -961,6 +1104,17 @@ async function deleteTask(taskId) {
 // 刷新任务列表
 async function refreshTasks(retryCount = 3) {
     try {
+        // 保存当前选中的状态和分类
+        const selectedStatus = document.querySelector('.status-btn.active')?.dataset.status || 'all';
+        const selectedCategory = document.querySelector('.category-btn.active')?.dataset.category || 'all';
+        
+        // 保存当前的搜索关键词
+        const searchInput = document.querySelector('.search-input');
+        const searchKeyword = searchInput ? searchInput.value.toLowerCase().trim() : '';
+        
+        // 保存当前选中的任务ID
+        const currentSelectedTaskIds = new Set(selectedTasks);
+        
         let result = await callApi('tasks');
         
         if (result.success) {
@@ -974,6 +1128,50 @@ async function refreshTasks(retryCount = 3) {
             }
             
             renderTasks();
+            
+            // 恢复选中的状态和分类
+            if (selectedStatus !== 'all') {
+                const statusBtn = document.querySelector(`.status-btn[data-status="${selectedStatus}"]`);
+                if (statusBtn) {
+                    document.querySelectorAll('.status-btn').forEach(btn => btn.classList.remove('active'));
+                    statusBtn.classList.add('active');
+                }
+            }
+            
+            if (selectedCategory !== 'all') {
+                const categoryBtn = document.querySelector(`.category-btn[data-category="${selectedCategory}"]`);
+                if (categoryBtn) {
+                    document.querySelectorAll('.category-btn').forEach(btn => btn.classList.remove('active'));
+                    categoryBtn.classList.add('active');
+                }
+            }
+            
+            // 恢复搜索框的值
+            if (searchInput && searchKeyword) {
+                searchInput.value = searchKeyword;
+            }
+            
+            // 重新应用筛选
+            filterTasks();
+            
+            // 恢复任务选中状态，但只选择仍然存在的任务
+            if (currentSelectedTaskIds.size > 0) {
+                // 清空当前选择
+                selectedTasks.clear();
+                
+                // 获取当前存在的任务ID列表
+                const existingTaskIds = new Set(state.tasks.map(task => task.order - 1));
+                
+                // 只恢复仍然存在的任务的选中状态
+                currentSelectedTaskIds.forEach(taskId => {
+                    if (existingTaskIds.has(taskId)) {
+                        selectedTasks.add(taskId);
+                    }
+                });
+                
+                // 更新UI
+                updateBatchOperationUI();
+            }
             
             // 如果已经挂载了拖放排序，重新初始化
             if (window.taskListSortable) {
@@ -1039,7 +1237,9 @@ async function updateTask(data) {
             pwd: pwd || data.pwd || originalTask.pwd || '',  // 优先使用新密码
             name: data.name.trim() || originalTask.name || '',
             category: data.category.trim() || originalTask.category || '',
-            cron: data.cron.trim() || originalTask.cron || ''
+            cron: data.cron.trim() || originalTask.cron || '',
+            regex_pattern: data.regex_pattern || originalTask.regex_pattern || '',
+            regex_replace: data.regex_replace || originalTask.regex_replace || ''
         };
         
         console.log('准备更新任务:', {
@@ -1271,7 +1471,24 @@ async function saveConfig() {
         saveBtn.innerHTML = '<i class="material-icons">hourglass_empty</i> 保存中...';
         
         const notifyEnabled = document.getElementById('notify-enabled').checked;
+        const notificationDelay = parseInt(document.getElementById('notification-delay').value) || 30;
         const globalCron = document.getElementById('global-cron').value.trim();
+        
+        // 获取网盘容量提醒配置
+        const quotaAlertEnabled = document.getElementById('quota-alert-enabled').checked;
+        const quotaThreshold = parseInt(document.getElementById('quota-threshold').value) || 90;
+        const quotaCheckSchedule = document.getElementById('quota-check-schedule').value.trim() || '0 0 * * *';
+        
+        // 获取分享配置
+        const defaultSharePassword = document.getElementById('default-share-password').value.trim();
+        // 使用 != null 检查来允许0值
+        const periodValue = document.getElementById('default-share-period').value;
+        const defaultSharePeriod = periodValue !== '' ? parseInt(periodValue) : 7;
+        
+        // 获取文件操作配置
+        const renameDelaySeconds = parseFloat(document.getElementById('rename-delay').value) || 0.5;
+        const batchSize = parseInt(document.getElementById('batch-size').value) || 50;
+        const concurrentLimit = parseInt(document.getElementById('concurrent-limit').value) || 1;
         
         // 收集所有通知字段
         const directFields = {};
@@ -1291,15 +1508,36 @@ async function saveConfig() {
             
         console.log('处理后的定时规则:', cronRules);
         console.log('收集到的通知字段:', directFields);
+        console.log('通知延迟时间:', notificationDelay);
+        console.log('网盘容量提醒配置:', {
+            enabled: quotaAlertEnabled,
+            threshold_percent: quotaThreshold,
+            check_schedule: quotaCheckSchedule
+        });
         
         const config = {
             notify: {
                 enabled: notifyEnabled,
+                notification_delay: notificationDelay,
                 direct_fields: directFields
             },
             cron: {
                 default_schedule: cronRules,
                 auto_install: true
+            },
+            quota_alert: {
+                enabled: quotaAlertEnabled,
+                threshold_percent: quotaThreshold,
+                check_schedule: quotaCheckSchedule
+            },
+            share: {
+                default_password: defaultSharePassword,
+                default_period_days: defaultSharePeriod
+            },
+            file_operations: {
+                rename_delay_seconds: renameDelaySeconds,
+                batch_size: batchSize,
+                concurrent_limit: concurrentLimit
             }
         };
         
@@ -1361,6 +1599,66 @@ function showError(message) {
     showNotification(message, 'error');
 }
 
+// 复制到剪贴板
+function copyToClipboard(text, buttonElement) {
+    if (navigator.clipboard && window.isSecureContext) {
+        // 使用现代的 Clipboard API
+        navigator.clipboard.writeText(text).then(() => {
+            showCopySuccess(buttonElement);
+        }).catch(err => {
+            console.error('复制失败:', err);
+            fallbackCopy(text, buttonElement);
+        });
+    } else {
+        // 降级到传统方法
+        fallbackCopy(text, buttonElement);
+    }
+}
+
+// 降级复制方法
+function fallbackCopy(text, buttonElement) {
+    const textArea = document.createElement('textarea');
+    textArea.value = text;
+    textArea.style.position = 'fixed';
+    textArea.style.left = '-999999px';
+    textArea.style.top = '-999999px';
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+    
+    try {
+        const successful = document.execCommand('copy');
+        if (successful) {
+            showCopySuccess(buttonElement);
+        } else {
+            showError('复制失败，请手动复制');
+        }
+    } catch (err) {
+        console.error('复制失败:', err);
+        showError('复制失败，请手动复制');
+    }
+    
+    document.body.removeChild(textArea);
+}
+
+// 显示复制成功的反馈
+function showCopySuccess(buttonElement) {
+    const originalIcon = buttonElement.querySelector('i').textContent;
+    const iconElement = buttonElement.querySelector('i');
+    
+    // 临时改变图标和样式
+    iconElement.textContent = 'check';
+    buttonElement.style.color = '#4caf50';
+    
+    // 2秒后恢复原样
+    setTimeout(() => {
+        iconElement.textContent = originalIcon;
+        buttonElement.style.color = '';
+    }, 2000);
+    
+    showSuccess('链接已复制到剪贴板');
+}
+
 // 事件监听器
 document.addEventListener('DOMContentLoaded', initializeApp);
 
@@ -1396,6 +1694,8 @@ async function handleTaskSubmit(event) {
         saveFieldHistory('save_dir', data.save_dir);
         if (data.cron) saveFieldHistory('cron', data.cron);
         if (data.category) saveFieldHistory('category', data.category);
+        if (data.regex_pattern) saveFieldHistory('regex_pattern', data.regex_pattern);
+        if (data.regex_replace) saveFieldHistory('regex_replace', data.regex_replace);
         
         // 如果有task_id，说明是编辑任务
         if (data.task_id) {
@@ -1408,7 +1708,9 @@ async function handleTaskSubmit(event) {
                 save_dir: data.save_dir,
                 name: data.name || '',
                 cron: data.cron || '',
-                category: data.category || ''
+                category: data.category || '',
+                regex_pattern: data.regex_pattern || '',
+                regex_replace: data.regex_replace || ''
             });
         }
         
@@ -1587,13 +1889,22 @@ function updateCategoryButtons(categories = []) {
         }
     });
 
+    // 如果当前分类不在新的分类列表中，且不是"全部"或"未分类"，保持当前选中的分类
+    if (currentCategory !== 'all' && currentCategory !== 'uncategorized' && !categories.includes(currentCategory)) {
+        // 如果当前选中的分类不在新的分类列表中，添加它
+        const button = document.createElement('button');
+        button.className = 'category-btn active';
+        button.setAttribute('data-category', currentCategory);
+        button.textContent = currentCategory;
+        button.onclick = () => filterByCategory(currentCategory);
+        categoryFilter.appendChild(button);
+    }
     // 如果当前没有找到选中的分类按钮，默认选中"全部分类"
-    if (!document.querySelector('.category-btn.active')) {
+    else if (!document.querySelector('.category-btn.active')) {
         allButton.classList.add('active');
     }
 
-    // 重新应用过滤器
-    filterTasks();
+    // 不在这里调用filterTasks，避免重复筛选
 }
 
 // 在初始化数据时调用获取分类
@@ -1694,8 +2005,30 @@ function filterTasks() {
             categoryMatch = task.dataset.category === selectedCategory;
         }
         
-        task.style.display = statusMatch && categoryMatch ? 'flex' : 'none';
+        const shouldShow = statusMatch && categoryMatch;
+        
+        // 使用CSS类来标记被筛选隐藏的任务
+        if (shouldShow) {
+            task.classList.remove('filtered-hidden');
+            task.style.display = 'flex';  // 默认显示
+        } else {
+            task.classList.add('filtered-hidden');
+            task.style.display = 'none';
+        }
     });
+    
+    // 应用当前的搜索条件
+    const searchInput = document.querySelector('.search-input');
+    if (searchInput && searchInput.value.trim()) {
+        const keyword = searchInput.value.toLowerCase().trim();
+        
+        document.querySelectorAll('.task-item:not(.filtered-hidden)').forEach(task => {
+            const taskName = task.querySelector('.task-name')?.textContent.toLowerCase() || '';
+            const saveDir = task.querySelector('.save-dir')?.textContent.toLowerCase() || '';
+            const shouldShow = taskName.includes(keyword) || saveDir.includes(keyword);
+            task.style.display = shouldShow ? 'flex' : 'none';
+        });
+    }
     
     // 更新异常指示器
     updateErrorIndicator();
@@ -1704,6 +2037,9 @@ function filterTasks() {
 // 在任务状态更改后更新分类
 async function refreshCategories() {
     try {
+        // 保存当前选中的分类
+        const selectedCategory = document.querySelector('.category-btn.active')?.dataset.category || 'all';
+        
         // 获取最新的分类列表
         const result = await callApi('categories');
         if (result.success) {
@@ -1711,6 +2047,18 @@ async function refreshCategories() {
             state.categories = new Set(result.categories || []);
             // 更新分类按钮
             updateCategoryButtons(result.categories);
+            
+            // 恢复选中的分类
+            if (selectedCategory !== 'all') {
+                const categoryBtn = document.querySelector(`.category-btn[data-category="${selectedCategory}"]`);
+                if (categoryBtn) {
+                    document.querySelectorAll('.category-btn').forEach(btn => btn.classList.remove('active'));
+                    categoryBtn.classList.add('active');
+                }
+            }
+            
+            // 重新应用筛选
+            filterTasks();
         }
     } catch (error) {
         console.error('更新分类失败:', error);
@@ -1721,6 +2069,10 @@ async function refreshCategories() {
 // 在任务添加、更新或删除后调用
 async function afterTaskOperation() {
     try {
+        // 保存当前的搜索关键词
+        const searchInput = document.querySelector('.search-input');
+        const searchKeyword = searchInput ? searchInput.value.toLowerCase().trim() : '';
+        
         // 刷新任务列表
         await refreshTasks();
 
@@ -1731,6 +2083,13 @@ async function afterTaskOperation() {
         updateCategoryList();
         updateSaveDirList();
         updateCronList();
+        
+        // 恢复搜索框的值
+        if (searchInput && searchKeyword) {
+            searchInput.value = searchKeyword;
+            // 重新应用搜索筛选
+            searchInput.dispatchEvent(new Event('input'));
+        }
 
         // 重新绑定事件
         bindTaskEvents();
@@ -1843,41 +2202,100 @@ async function handleUserSubmit(event) {
 // 检查应用更新
 async function checkForUpdates() {
     try {
-        // 通过后端API获取版本信息
-        const response = await callApi('version/check');
-        if (!response.success) {
-            console.warn('无法获取最新版本信息:', response.message);
+        // 依次尝试不同的更新源
+        let response = null;
+        let success = false;
+        
+        for (const source of VERSION_CHECK_SOURCES) {
+            try {
+                console.log(`尝试从 ${source} 获取更新信息...`);
+                response = await callApi(`version/check?source=${source}`, 'GET', null, false);
+                
+                if (response.success) {
+                    success = true;
+                    console.log(`成功从 ${source} 获取更新信息`);
+                    break;
+                } else {
+                    console.warn(`从 ${source} 获取更新失败: ${response.message}`);
+                }
+            } catch (error) {
+                console.warn(`从 ${source} 获取更新出错: ${error.message || error}`);
+            }
+        }
+        
+        if (!success || !response) {
+            console.warn('所有更新源都检查失败');
             return;
         }
         
-        // 规范化版本号（移除 'v' 前缀并分割为数组）
+        const latestVersion = response.version;
+        const currentVersion = APP_VERSION;
+        
+        console.log(`比较版本: 最新版本=${latestVersion}, 当前版本=${currentVersion}`);
+        
+        // 规范化版本号以便比较
         const normalizeVersion = (version) => {
-            return version.replace(/^v/, '').split('.').map(Number);
+            // 处理 'latest' 特殊标签
+            if (version === 'latest') return '999.999.999';
+            
+            // 从版本字符串中提取版本号，支持多种格式：
+            // 1. "Release v1.0.8" -> "v1.0.8"
+            // 2. "v1.0.8" -> "v1.0.8"
+            // 3. "1.0.8" -> "1.0.8"
+            const versionMatch = version.match(/(?:Release\s+)?(v?\d+\.\d+\.\d+)/i);
+            let cleanVersion = version;
+            
+            if (versionMatch) {
+                cleanVersion = versionMatch[1];
+            }
+            
+            // 移除v前缀
+            cleanVersion = cleanVersion.replace(/^v/i, '');
+            
+            // 分割为主版本、次版本和补丁版本
+            const parts = cleanVersion.split('.');
+            
+            // 确保有三个部分，缺少的部分用0填充
+            while (parts.length < 3) parts.push('0');
+            
+            // 将每个部分转换为数字并填充为3位数
+            return parts.map(part => {
+                const num = parseInt(part, 10) || 0;
+                return num.toString().padStart(3, '0');
+            }).join('.');
         };
         
         // 比较版本号
         const compareVersions = (v1, v2) => {
-            const v1Parts = normalizeVersion(v1);
-            const v2Parts = normalizeVersion(v2);
+            const norm1 = normalizeVersion(v1);
+            const norm2 = normalizeVersion(v2);
             
-            for (let i = 0; i < Math.max(v1Parts.length, v2Parts.length); i++) {
-                const v1Part = v1Parts[i] || 0;
-                const v2Part = v2Parts[i] || 0;
-                if (v1Part > v2Part) return 1;
-                if (v1Part < v2Part) return -1;
-            }
-            return 0;
+            console.log(`规范化版本: ${v1} -> ${norm1}, ${v2} -> ${norm2}`);
+            
+            if (norm1 === norm2) return 0;
+            return norm1 > norm2 ? 1 : -1;
         };
         
-        const latestVersion = response.version;
-        console.log(`检查版本：当前 ${APP_VERSION} 最新 ${latestVersion}`);
+        // 检查是否有新版本
+        const needsUpdate = compareVersions(latestVersion, currentVersion) > 0;
         
-        // 只有当最新版本号大于当前版本号时才显示更新提示
-        if (latestVersion && compareVersions(latestVersion, APP_VERSION) > 0) {
-            // 显示更新指示器
+        if (needsUpdate) {
+            console.log(`发现新版本: ${latestVersion}，当前版本: ${currentVersion}`);
+            
+            // 构建更新链接
+            let updateLink = '';
+            if (response.source === 'github') {
+                updateLink = response.link || `https://github.com/${GITHUB_REPO}/releases/latest`;
+            } else {
+                // Docker Hub 或 1ms.run API
+                updateLink = response.link || `https://hub.docker.com/r/kokojacket/baidu-autosave/tags`;
+            }
+            
+            // 更新UI以显示更新通知
             const updateIndicator = document.getElementById('update-indicator');
             if (updateIndicator) {
                 updateIndicator.classList.add('active');
+                updateIndicator.title = `发现新版本: ${latestVersion}`;
                 
                 // 添加点击事件，点击后导航到发布页面
                 const versionContainer = document.querySelector('.version-container');
@@ -1885,11 +2303,13 @@ async function checkForUpdates() {
                     versionContainer.style.cursor = 'pointer';
                     versionContainer.title = `发现新版本 ${latestVersion}，点击查看更新`;
                     versionContainer.addEventListener('click', () => {
-                        window.open(`https://github.com/${GITHUB_REPO}/releases/latest`, '_blank');
+                        window.open(updateLink, '_blank');
                     });
                 }
             }
         } else {
+            console.log('已经是最新版本');
+            
             // 如果不需要更新，确保移除更新指示器
             const updateIndicator = document.getElementById('update-indicator');
             if (updateIndicator) {
@@ -1919,8 +2339,13 @@ async function initializeApp() {
         // 3. 初始化事件监听器
         initializeEventListeners();
         
-        // 4. 初始化WebSocket连接
-        socket = initWebSocket();
+        // 4. 初始化通信方式（只使用轮询，禁用WebSocket）
+        // WebSocket已禁用
+        
+        // 初始化轮询
+        if (POLLING_CONFIG.enabled) {
+            initPolling();
+        }
         
         // 5. 检查是否有新版本
         checkForUpdates();
@@ -1933,6 +2358,12 @@ async function initializeApp() {
         
         // 8. 更新异常指示器
         updateErrorIndicator();
+        
+        // 9. 初始化分享链接自动填充功能
+        initShareUrlAutoFill();
+        
+        // 10. 初始化任务名称同步功能
+        initTaskNameSync();
         
     } catch (error) {
         console.error('应用初始化失败:', error);
@@ -1953,6 +2384,12 @@ function initializeEventListeners() {
     const addPushplusTokenBtn = document.getElementById('add-pushplus-token-btn');
     const addPushplusUserBtn = document.getElementById('add-pushplus-user-btn');
     const addBarkBtn = document.getElementById('add-bark-btn');
+    const addWebhookBtn = document.getElementById('add-webhook-btn');
+    
+    // 容量提醒相关元素
+    const quotaAlertEnabled = document.getElementById('quota-alert-enabled');
+    const quotaThreshold = document.getElementById('quota-threshold');
+    const quotaCheckSchedule = document.getElementById('quota-check-schedule');
     
     // 任务搜索
     const searchInput = document.querySelector('.search-input');
@@ -1964,12 +2401,56 @@ function initializeEventListeners() {
                 const tasks = document.querySelectorAll('.task-item');
                 
                 tasks.forEach(task => {
-                    const taskName = task.querySelector('.task-name')?.textContent.toLowerCase() || '';
-                    const saveDir = task.querySelector('.save-dir')?.textContent.toLowerCase() || '';
-                    const shouldShow = taskName.includes(keyword) || saveDir.includes(keyword);
-                    task.style.display = shouldShow ? 'flex' : 'none';
+                    // 首先检查任务是否已经被状态和分类筛选隐藏
+                    // 如果已经被隐藏，则不需要再考虑搜索条件
+                    const hiddenByFilter = task.classList.contains('filtered-hidden');
+                    
+                    if (!hiddenByFilter) {
+                        const taskName = task.querySelector('.task-name')?.textContent.toLowerCase() || '';
+                        const saveDir = task.querySelector('.save-dir')?.textContent.toLowerCase() || '';
+                        const shouldShow = taskName.includes(keyword) || saveDir.includes(keyword);
+                        task.style.display = shouldShow ? 'flex' : 'none';
+                    }
                 });
             });
+        });
+        
+        // 添加清除搜索按钮事件
+        const clearSearchBtn = document.querySelector('.clear-search-btn');
+        if (clearSearchBtn) {
+            clearSearchBtn.addEventListener('click', () => {
+                searchInput.value = '';
+                // 触发input事件以更新显示
+                searchInput.dispatchEvent(new Event('input'));
+            });
+        }
+    }
+    
+    // 容量提醒启用/禁用事件
+    if (quotaAlertEnabled) {
+        quotaAlertEnabled.addEventListener('change', (e) => {
+            const enabled = e.target.checked;
+            // 更新输入框状态
+            if (quotaThreshold) quotaThreshold.disabled = !enabled;
+            if (quotaCheckSchedule) quotaCheckSchedule.disabled = !enabled;
+        });
+        
+        // 初始化时设置输入框状态
+        const enabled = quotaAlertEnabled.checked;
+        if (quotaThreshold) quotaThreshold.disabled = !enabled;
+        if (quotaCheckSchedule) quotaCheckSchedule.disabled = !enabled;
+    }
+    
+    // 容量阈值输入限制
+    if (quotaThreshold) {
+        quotaThreshold.addEventListener('input', (e) => {
+            let value = parseInt(e.target.value);
+            if (isNaN(value) || value < 1) {
+                value = 1;
+            } else if (value > 99) {
+                value = 99;
+            }
+            e.target.value = value;
         });
     }
     
@@ -2009,12 +2490,14 @@ function initializeEventListeners() {
             const valueInput = document.getElementById('new-notify-value');
             
             const key = keyInput.value.trim();
-            const value = valueInput.value.trim();
+            let value = valueInput.value.trim();
             
             if (!key) {
                 showError('字段名称不能为空');
                 return;
             }
+            
+            // WEBHOOK_BODY字段由后端自动格式化，前端不需要处理
             
             // 检查字段是否已存在
             const existingField = document.querySelector(`.notify-field[data-key="${key}"]`);
@@ -2080,6 +2563,39 @@ function initializeEventListeners() {
         });
     }
     
+    // 快速添加WEBHOOK配置按钮
+    if (addWebhookBtn) {
+        addWebhookBtn.addEventListener('click', () => {
+            const webhookFields = [
+                { key: 'WEBHOOK_URL', value: 'https://your-webhook-url.com/api/notifications', placeholder: '请输入Webhook URL' },
+                { key: 'WEBHOOK_METHOD', value: 'POST' },
+                { key: 'WEBHOOK_CONTENT_TYPE', value: 'application/json' },
+                { key: 'WEBHOOK_HEADERS', value: 'Content-Type: application/json' },
+                { key: 'WEBHOOK_BODY', value: 'title: "$title"content: "$content"source: "我的项目"' }
+            ];
+            
+            let addedCount = 0;
+            let existingFields = [];
+            
+            webhookFields.forEach(field => {
+                const existingField = document.querySelector(`.notify-field[data-key="${field.key}"]`);
+                if (!existingField) {
+                    // WEBHOOK_BODY字段在保存时由后端自动格式化
+                    addNotifyFieldToUI(field.key, field.value);
+                    addedCount++;
+                } else {
+                    existingFields.push(field.key);
+                }
+            });
+            
+            if (addedCount > 0) {
+                showSuccess(`已添加 ${addedCount} 个WEBHOOK字段${existingFields.length > 0 ? `，${existingFields.join(', ')} 已存在` : ''}`);
+            } else {
+                showError('所有WEBHOOK字段都已存在');
+            }
+        });
+    }
+    
     // 登录凭据更新按钮
     const updateAuthBtn = document.getElementById('update-auth-btn');
     if (updateAuthBtn) {
@@ -2137,6 +2653,10 @@ function initializeEventListeners() {
                 form.reset();
                 form.elements['task_id'].value = '';
             }
+            
+            // 重置保存目录编辑标志，重新启用单向同步
+            window.hasManuallySaveDirEdited = false;
+            console.log('新建任务：重置保存目录编辑标志，启用单向同步');
             
             // 显示模态框
             showModal('task-modal');
@@ -2202,11 +2722,41 @@ function updateLoginStatus(user) {
             displayName,
             fullUserInfo: user
         });
+        
+        // 获取用户配额信息
+        fetchUserQuota().then(quotaInfo => {
+            if (quotaInfo) {
+                // 在用户名右侧显示配额信息
+                const quotaElement = document.createElement('span');
+                quotaElement.className = 'quota-info';
+                quotaElement.innerHTML = `${quotaInfo.used_gb}GB / ${quotaInfo.total_gb}GB`;
+                quotaElement.title = `已使用: ${quotaInfo.used_gb}GB, 总容量: ${quotaInfo.total_gb}GB (${quotaInfo.percent}%)`;
+                
+                // 添加到用户名后面
+                currentUserElement.appendChild(quotaElement);
+            }
+        }).catch(error => {
+            console.error('获取配额信息失败:', error);
+        });
     } else {
         currentUserElement.innerHTML = '未登录';
         currentUserElement.classList.remove('logged-in');
         currentUserElement.title = '未登录';
         console.log('用户未登录');
+    }
+}
+
+// 获取用户配额信息
+async function fetchUserQuota() {
+    try {
+        const response = await callApi('user/quota', 'GET', null, false);
+        if (response.success && response.quota) {
+            return response.quota;
+        }
+        return null;
+    } catch (error) {
+        console.error('获取用户配额信息失败:', error);
+        return null;
     }
 }
 
@@ -2867,4 +3417,434 @@ function toggleCategoryDropdown() {
             document.addEventListener('click', e => handleOutsideClick(e, 'category-dropdown'));
         }, 10);
     }
+}
+
+// 初始化轮询
+function initPolling() {
+    // 如果已经存在轮询定时器，先清除
+    if (taskStatusPollingTimer) {
+        clearInterval(taskStatusPollingTimer);
+        taskStatusPollingTimer = null;
+    }
+    
+    if (logPollingTimer) {
+        clearInterval(logPollingTimer);
+        logPollingTimer = null;
+    }
+    
+    // 如果轮询未启用，直接返回
+    if (!POLLING_CONFIG.enabled) {
+        console.log('轮询功能已禁用');
+        return;
+    }
+    
+    console.log('初始化轮询...');
+    
+    // 启动任务状态轮询
+    taskStatusPollingTimer = setInterval(pollTaskStatus, POLLING_CONFIG.taskStatusInterval);
+    
+    // 启动日志轮询
+    logPollingTimer = setInterval(pollLogs, POLLING_CONFIG.logInterval);
+    
+    // 立即执行一次轮询
+    pollTaskStatus();
+    pollLogs();
+}
+
+// 轮询任务状态
+async function pollTaskStatus() {
+    if (!POLLING_CONFIG.enabled) return;
+    
+    try {
+        const response = await fetch('/api/tasks/status');
+        if (!response.ok) {
+            throw new Error(`HTTP错误 ${response.status}`);
+        }
+        
+        const result = await response.json();
+        if (result.success) {
+            // 更新任务状态
+            updateTasksFromPolling(result.tasks);
+            pollingRetryCount = 0;
+        } else {
+            console.error('轮询任务状态失败:', result.message);
+            handlePollingError();
+        }
+    } catch (error) {
+        console.error('轮询任务状态出错:', error);
+        handlePollingError();
+    }
+}
+
+// 轮询日志
+async function pollLogs() {
+    if (!POLLING_CONFIG.enabled) return;
+    
+    try {
+        const response = await fetch('/api/logs?limit=10');
+        if (!response.ok) {
+            throw new Error(`HTTP错误 ${response.status}`);
+        }
+        
+        const result = await response.json();
+        if (result.success) {
+            // 更新日志
+            updateLogsFromPolling(result.logs);
+            pollingRetryCount = 0;
+        } else {
+            console.error('轮询日志失败:', result.message);
+            handlePollingError();
+        }
+    } catch (error) {
+        console.error('轮询日志出错:', error);
+        handlePollingError();
+    }
+}
+
+// 处理轮询错误
+function handlePollingError() {
+    pollingRetryCount++;
+    
+    if (pollingRetryCount > POLLING_CONFIG.retryCount) {
+        // 超过最大重试次数，暂停轮询一段时间
+        if (taskStatusPollingTimer) {
+            clearInterval(taskStatusPollingTimer);
+            taskStatusPollingTimer = null;
+        }
+        
+        if (logPollingTimer) {
+            clearInterval(logPollingTimer);
+            logPollingTimer = null;
+        }
+        
+        console.log(`轮询失败次数过多，暂停 ${POLLING_CONFIG.retryDelay/1000} 秒后重试`);
+        
+        // 一段时间后重新启动轮询
+        setTimeout(initPolling, POLLING_CONFIG.retryDelay);
+    }
+}
+
+// 从轮询更新任务状态
+function updateTasksFromPolling(tasks) {
+    if (!Array.isArray(tasks)) return;
+    
+    // 保存当前选中的状态和分类
+    const selectedStatus = document.querySelector('.status-btn.active')?.dataset.status || 'all';
+    const selectedCategory = document.querySelector('.category-btn.active')?.dataset.category || 'all';
+    
+    // 保存当前的搜索关键词
+    const searchInput = document.querySelector('.search-input');
+    const searchKeyword = searchInput ? searchInput.value.toLowerCase().trim() : '';
+    
+    // 保存当前选中的任务ID
+    const currentSelectedTaskIds = new Set(selectedTasks);
+    
+    // 更新全局状态
+    state.tasks = tasks;
+    
+    // 更新UI
+    renderTasks();
+    
+    // 恢复选中的状态和分类
+    if (selectedStatus !== 'all') {
+        const statusBtn = document.querySelector(`.status-btn[data-status="${selectedStatus}"]`);
+        if (statusBtn) {
+            document.querySelectorAll('.status-btn').forEach(btn => btn.classList.remove('active'));
+            statusBtn.classList.add('active');
+        }
+    }
+    
+    if (selectedCategory !== 'all') {
+        const categoryBtn = document.querySelector(`.category-btn[data-category="${selectedCategory}"]`);
+        if (categoryBtn) {
+            document.querySelectorAll('.category-btn').forEach(btn => btn.classList.remove('active'));
+            categoryBtn.classList.add('active');
+        }
+    }
+    
+    // 恢复搜索框的值
+    if (searchInput && searchKeyword) {
+        searchInput.value = searchKeyword;
+    }
+    
+    // 重新应用筛选（包括状态、分类和搜索）
+    filterTasks();
+    
+    // 恢复任务选中状态，但只选择仍然存在的任务
+    if (currentSelectedTaskIds.size > 0) {
+        // 清空当前选择
+        selectedTasks.clear();
+        
+        // 获取当前存在的任务ID列表
+        const existingTaskIds = new Set(state.tasks.map(task => task.order - 1));
+        
+        // 只恢复仍然存在的任务的选中状态
+        currentSelectedTaskIds.forEach(taskId => {
+            if (existingTaskIds.has(taskId)) {
+                selectedTasks.add(taskId);
+            }
+        });
+        
+        // 更新UI
+        updateBatchOperationUI();
+    }
+    
+    // 检查是否有正在运行的任务
+    const runningTasks = tasks.filter(task => task.status === 'running');
+    if (runningTasks.length > 0) {
+        // 如果有正在运行的任务，加快轮询频率
+        if (taskStatusPollingTimer) {
+            clearInterval(taskStatusPollingTimer);
+            taskStatusPollingTimer = setInterval(pollTaskStatus, Math.min(POLLING_CONFIG.taskStatusInterval, 2000));
+        }
+    } else {
+        // 恢复正常轮询频率
+        if (taskStatusPollingTimer) {
+            clearInterval(taskStatusPollingTimer);
+            taskStatusPollingTimer = setInterval(pollTaskStatus, POLLING_CONFIG.taskStatusInterval);
+        }
+    }
+}
+
+// 从轮询更新日志
+function updateLogsFromPolling(logs) {
+    if (!Array.isArray(logs) || logs.length === 0) return;
+    
+    // 获取进度模态框
+    const progressModal = document.getElementById('progress-modal');
+    if (!progressModal || !progressModal.classList.contains('active')) return;
+    
+    // 更新日志
+    const logContainer = document.getElementById('log-container');
+    if (!logContainer) return;
+    
+    // 只添加新日志
+    const lastTimestamp = lastLogUpdateTime;
+    let hasNewLogs = false;
+    
+    logs.forEach(log => {
+        // 解析时间戳
+        try {
+            const logTime = new Date(log.timestamp).getTime();
+            if (logTime > lastTimestamp) {
+                // 这是新日志
+                appendLog(log.message, log.level.toLowerCase(), log.timestamp);
+                lastLogUpdateTime = Math.max(lastLogUpdateTime, logTime);
+                hasNewLogs = true;
+            }
+        } catch (e) {
+            // 时间戳解析失败，直接添加
+            appendLog(log.message, log.level.toLowerCase());
+            hasNewLogs = true;
+        }
+    });
+    
+    // 如果有新日志，滚动到底部
+    if (hasNewLogs && logContainer) {
+        logContainer.scrollTop = logContainer.scrollHeight;
+    }
+}
+
+async function shareTask(taskId) {
+    if (!confirm('确定要生成此任务的分享链接吗？')) return;
+    
+    try {
+        showLoading('正在生成分享链接...');
+        
+        const result = await callApi('task/share', 'POST', { task_id: taskId });
+        
+        if (result.success) {
+            // 更新任务的分享信息
+            const task = findTaskById(taskId);
+            if (task) {
+                task.share_info = result.share_info;
+                
+                // 重新渲染任务列表
+                renderTasks();
+            }
+            
+            showSuccess('分享链接生成成功');
+        } else {
+            throw new Error(result.message || '生成分享链接失败');
+        }
+    } catch (error) {
+        showError(error.message || '生成分享链接失败');
+    } finally {
+        hideLoading();
+    }
+}
+
+// 自动获取分享链接文件夹名称
+function initShareUrlAutoFill() {
+    const urlInput = document.querySelector('input[name="url"]');
+    const nameInput = document.querySelector('input[name="name"]');
+    
+    if (!urlInput || !nameInput) return;
+    
+    let autoFillTimeout;
+    let hasManuallyEdited = nameInput.value.trim() !== ''; // 如果已有名称，认为是手动编辑过的
+    
+    // 监听任务名称的手动编辑
+    nameInput.addEventListener('input', () => {
+        hasManuallyEdited = true;
+    });
+    
+    // 监听分享链接失去焦点事件（用户输入完成后离开文本框）
+    urlInput.addEventListener('blur', (e) => {
+        const url = e.target.value.trim();
+        
+        console.log('分享链接失去焦点:', url); // 调试日志
+        
+        // 清除之前的定时器
+        if (autoFillTimeout) {
+            clearTimeout(autoFillTimeout);
+        }
+        
+        // 每次分享链接更新时都重置手动编辑标志，允许自动填充
+        hasManuallyEdited = false;
+        
+        // 如果URL为空，清空任务名称
+        if (!url) {
+            nameInput.value = '';
+            syncTaskNameToSaveDir();
+            return;
+        }
+        
+        // 检查是否是有效的百度网盘链接
+        if (!url.match(/^https?:\/\/pan\.baidu\.com\/s\/[a-zA-Z0-9_-]+/)) {
+            console.log('无效的百度网盘链接格式:', url);
+            return;
+        }
+        
+        console.log('开始获取分享文件夹名称:', url);
+        // 立即执行，不需要延迟
+        getShareFolderName(url);
+    });
+    
+    // 也监听input事件来处理清空URL的情况
+    urlInput.addEventListener('input', (e) => {
+        const url = e.target.value.trim();
+        
+        // 如果URL被清空，清空任务名称
+        if (!url && !hasManuallyEdited) {
+            nameInput.value = '';
+            syncTaskNameToSaveDir();
+        }
+    });
+}
+
+// 获取分享链接的文件夹名称
+async function getShareFolderName(url) {
+    try {
+        console.log('正在请求分享链接信息...', url);
+        
+        // 提取密码
+        let pwd = '';
+        if (url.includes('?pwd=')) {
+            const parts = url.split('?pwd=');
+            pwd = parts[1];
+            console.log('提取到密码:', pwd);
+        }
+        
+        const response = await fetch('/api/share/info', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ url, pwd })
+        });
+        
+        console.log('API响应状态:', response.status);
+        
+        const result = await response.json();
+        console.log('API响应结果:', result);
+        
+        if (result.success && result.folder_name) {
+            const nameInput = document.querySelector('input[name="name"]');
+            if (nameInput && !nameInput.value.trim()) {
+                console.log('自动填充任务名称:', result.folder_name);
+                nameInput.value = result.folder_name;
+                // 触发任务名称同步到保存目录的功能
+                syncTaskNameToSaveDir();
+                console.log('任务名称已同步到保存目录');
+            } else {
+                console.log('任务名称已存在，跳过自动填充');
+            }
+        } else {
+            console.warn('获取文件夹名称失败:', result.message || '未知错误');
+        }
+    } catch (error) {
+        console.error('获取分享文件夹名称失败:', error);
+        // 静默失败，不影响用户使用
+    }
+}
+
+// 任务名称同步到保存目录路径
+function syncTaskNameToSaveDir() {
+    const nameInput = document.querySelector('input[name="name"]');
+    const saveDirInput = document.querySelector('input[name="save_dir"]');
+    
+    if (!nameInput || !saveDirInput) {
+        console.log('任务名称同步失败：找不到输入框元素');
+        return;
+    }
+    
+    // 如果用户已手动编辑过保存目录，则不再进行单向同步
+    if (window.hasManuallySaveDirEdited) {
+        console.log('用户已手动编辑过保存目录，跳过单向同步');
+        return;
+    }
+    
+    const taskName = nameInput.value.trim();
+    if (!taskName) {
+        console.log('任务名称为空，跳过同步');
+        return;
+    }
+    
+    const currentSaveDir = saveDirInput.value.trim();
+    console.log(`同步任务名称到保存目录: "${taskName}" -> 当前保存目录: "${currentSaveDir}"`);
+    
+    // 如果保存目录为空或只是根目录，直接设置为任务名
+    if (!currentSaveDir || currentSaveDir === '/') {
+        const newSaveDir = `/${taskName}`;
+        saveDirInput.value = newSaveDir;
+        console.log(`保存目录已更新: "${newSaveDir}"`);
+        return;
+    }
+    
+    // 如果保存目录已有内容，替换最后一级目录为任务名
+    const parts = currentSaveDir.split('/').filter(p => p); // 去掉空字符串
+    if (parts.length > 0) {
+        const oldLastDir = parts[parts.length - 1];
+        parts[parts.length - 1] = taskName; // 替换最后一级
+        const newSaveDir = `/${parts.join('/')}`;
+        saveDirInput.value = newSaveDir;
+        console.log(`保存目录最后一级已更新: "${oldLastDir}" -> "${taskName}" (完整路径: "${newSaveDir}")`);
+    } else {
+        const newSaveDir = `/${taskName}`;
+        saveDirInput.value = newSaveDir;
+        console.log(`保存目录已更新: "${newSaveDir}"`);
+    }
+}
+
+// 初始化任务名称同步功能
+function initTaskNameSync() {
+    const nameInput = document.querySelector('input[name="name"]');
+    const saveDirInput = document.querySelector('input[name="save_dir"]');
+    
+    if (!nameInput || !saveDirInput) return;
+    
+    // 初始化保存目录手动编辑标志
+    window.hasManuallySaveDirEdited = saveDirInput.value.trim() !== ''; // 如果已有保存目录，认为是手动编辑过的
+    
+    // 监听保存目录的手动编辑
+    saveDirInput.addEventListener('input', () => {
+        window.hasManuallySaveDirEdited = true;
+        console.log('用户手动编辑了保存目录，禁用单向同步');
+    });
+    
+    // 监听任务名称变化，同步到保存目录
+    nameInput.addEventListener('input', () => {
+        syncTaskNameToSaveDir();
+    });
 }

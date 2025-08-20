@@ -13,32 +13,81 @@ from utils import generate_transfer_notification
 from notify import send as notify_send
 from datetime import datetime
 from flask_cors import CORS
-from geventwebsocket.handler import WebSocketHandler
-from geventwebsocket.websocket import WebSocket
-from gevent.pywsgi import WSGIServer
 import time
-from gevent.queue import Queue
-from geventwebsocket.exceptions import WebSocketError
 import socket
+
+# 尝试导入WebSocket相关模块
+try:
+    from geventwebsocket.handler import WebSocketHandler
+    from geventwebsocket.websocket import WebSocket
+    from gevent.pywsgi import WSGIServer
+    from geventwebsocket.exceptions import WebSocketError
+    from gevent.queue import Queue
+    # 强制禁用WebSocket
+    WEBSOCKET_AVAILABLE = False
+    logger.info("WebSocket支持已禁用，将使用普通HTTP轮询")
+except ImportError:
+    from gevent.pywsgi import WSGIServer
+    WEBSOCKET_AVAILABLE = False
+    logger.info("WebSocket支持未启用，将使用普通HTTP轮询")
 
 # GitHub 仓库信息
 GITHUB_REPO = 'kokojacket/baidu-autosave'
+# Docker Hub 信息
+DOCKER_HUB_RSS = 'https://rsshub.rssforever.com/dockerhub/tag/kokojacket/baidu-autosave'
+# 备用 Docker Hub RSS 源
+DOCKER_HUB_RSS_ALT = 'https://rss.kuaisouxia.com/dockerhub/tag/kokojacket/baidu-autosave'
+# 1ms.run API 源
+MS_RUN_API = 'https://1ms.run/api/v1/registry/get_tags'
 
 # 创建日志目录
 os.makedirs('log', exist_ok=True)
 
 # 配置日志
 logger.remove()  # 移除默认的控制台输出
-# 添加控制台输出，设置日志级别为 INFO
-logger.add(sys.stdout, level="INFO", 
-          format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>")
-# 添加文件输出，设置日志级别为 DEBUG
+
+# 定义统一的日志格式和级别
+log_format = "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
+log_level = "DEBUG"  # 使用DEBUG级别，可以看到所有日志
+
+# 过滤敏感信息
+def filter_sensitive_info(record):
+    """过滤敏感信息，如BDUSS和cookies"""
+    message = record["message"]
+    # 替换BDUSS
+    message = re.sub(r"BDUSS['\"]?\s*:\s*['\"]?([^'\"]+)['\"]?", "BDUSS: [已隐藏]", message)
+    # 替换cookies
+    message = re.sub(r"cookies['\"]?\s*:\s*['\"]?([^'\"]+)['\"]?", "cookies: [已隐藏]", message)
+    record["message"] = message
+    return True
+
+# 过滤轮询请求日志
+def filter_polling_requests(record):
+    """过滤轮询请求的日志，如/api/tasks/status和/api/logs"""
+    message = record["message"]
+    
+    # 检查是否是HTTP请求日志（WSGI服务器的访问日志）
+    if "GET /api/tasks/status HTTP" in message or "GET /api/logs?limit=" in message:
+        return False  # 不显示这些日志
+    
+    return True  # 显示其他所有日志
+
+# 应用过滤器到所有日志处理器
+logger.configure(patcher=filter_sensitive_info)
+
+# 添加彩色的控制台输出（带轮询过滤）
+logger.add(sys.stdout, 
+          level=log_level, 
+          format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+          filter=filter_polling_requests)  # 添加轮询过滤器
+
+# 添加文件输出 (内容与控制台输出相同，但没有颜色标记，且不过滤轮询请求)
 logger.add("log/web_app_{time:YYYY-MM-DD}.log", 
-          rotation="00:00", # 每天零点创建新文件
-          retention="7 days", # 保留7天的日志
-          level="DEBUG",
+          rotation="00:00",  # 每天零点创建新文件
+          retention="7 days",  # 保留7天的日志
+          level=log_level,
           encoding="utf-8",
-          format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}")
+          format=log_format)
 
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-here'  # 用于session加密
@@ -72,6 +121,9 @@ def login_required(f):
 
 def broadcast_message(message):
     """广播消息到所有WebSocket客户端"""
+    if not WEBSOCKET_AVAILABLE or not clients:
+        return
+        
     disconnected_clients = set()
     for client in clients:
         try:
@@ -160,6 +212,8 @@ def login():
             password == auth_config.get('password')):
             session['username'] = username
             session['login_time'] = time.time()
+            
+            # 直接重定向到首页，不再等待获取用户配额信息
             return redirect(url_for('index'))
         else:
             return render_template('login.html', message='用户名或密码错误')
@@ -200,6 +254,9 @@ def index():
                 
                 # 记录日志
                 logger.info(f"登录状态检查 - 管理员: {admin_logged_in}, 百度用户: {baidu_logged_in}, 当前用户: {current_user}")
+                
+                # 异步获取用户配额信息 - 不阻塞页面加载
+                # 用户配额信息将通过API端点/api/user/quota获取
             except Exception as e:
                 logger.error(f"获取数据失败: {str(e)}")
                 init_error = str(e)
@@ -275,6 +332,8 @@ def add_task():
     name = data.get('name', '').strip()
     cron = data.get('cron', '').strip()
     category = data.get('category', '').strip()
+    regex_pattern = data.get('regex_pattern', '').strip()
+    regex_replace = data.get('regex_replace', '').strip()
     
     if not url or not save_dir:
         return jsonify({'success': False, 'message': '分享链接和保存目录不能为空'})
@@ -290,7 +349,7 @@ def add_task():
         
     try:
         # 添加任务 - storage.py 内部会处理调度器更新
-        if storage.add_task(url, save_dir, pwd, name, cron, category):
+        if storage.add_task(url, save_dir, pwd, name, cron, category, regex_pattern, regex_replace):
             # 广播任务添加消息
             broadcast_message({
                 'type': 'task_added',
@@ -359,6 +418,8 @@ def update_task():
         'name': data.get('name', '').strip(),
         'cron': data.get('cron', '').strip(),
         'category': data.get('category', '').strip(),
+        'regex_pattern': data.get('regex_pattern', '').strip(),
+        'regex_replace': data.get('regex_replace', '').strip(),
         'order': task_order,  # 保持原有的order
         'status': task.get('status', 'normal'),  # 保持原有的状态
         'message': task.get('message', ''),  # 保持原有的消息
@@ -394,6 +455,46 @@ def update_task():
     except Exception as e:
         logger.error(f"更新任务失败: {str(e)}")
         return jsonify({'success': False, 'message': f'更新任务失败: {str(e)}'})
+
+@app.route('/api/share/info', methods=['POST'])
+@login_required
+@handle_api_error
+def get_share_info():
+    """获取分享链接信息"""
+    data = request.get_json()
+    url = data.get('url', '').strip()
+    pwd = data.get('pwd', '').strip()
+    
+    if not url:
+        return jsonify({'success': False, 'message': '分享链接不能为空'})
+    
+    try:
+        # 移除URL中的hash部分
+        url = url.split('#')[0]
+        
+        # 处理URL中的密码部分
+        if '?pwd=' in url:
+            url, extracted_pwd = url.split('?pwd=')
+            pwd = extracted_pwd.strip()
+        
+        # 获取分享文件信息
+        result = storage.get_share_folder_name(url, pwd)
+        
+        if result['success']:
+            return jsonify({
+                'success': True,
+                'folder_name': result['folder_name'],
+                'message': '获取文件夹名称成功'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'message': result.get('error', '获取分享信息失败')
+            })
+            
+    except Exception as e:
+        logger.error(f"获取分享信息失败: {str(e)}")
+        return jsonify({'success': False, 'message': f'获取分享信息失败: {str(e)}'})
 
 @app.route('/api/task/delete', methods=['POST'])
 @login_required
@@ -494,6 +595,21 @@ def execute_task():
     broadcast_task_progress(task_id, 0, 'running')
     
     try:
+        # 重新获取最新的任务数据，确保使用最新的密码等信息
+        latest_tasks = storage.list_tasks()
+        latest_tasks.sort(key=lambda x: x.get('order', float('inf')))
+        latest_task = None
+        for t in latest_tasks:
+            if t.get('order') == task_order:
+                latest_task = t
+                break
+        
+        if not latest_task:
+            return jsonify({'success': False, 'message': f'任务已不存在(order={task_order})'})
+        
+        # 使用最新任务数据
+        task = latest_task
+        
         def progress_callback(status, message):
             broadcast_task_log(message, status)
             if status == 'info' and message.startswith('添加文件:'):
@@ -506,7 +622,8 @@ def execute_task():
             task.get('pwd'),
             None,
             task.get('save_dir'),
-            progress_callback
+            progress_callback,
+            task  # 传入完整的任务配置
         )
         
         if result.get('success'):
@@ -553,10 +670,12 @@ def execute_task():
 
     except Exception as e:
         error_msg = str(e)
+        # 使用存储模块的错误解析功能
+        parsed_error = storage._parse_share_error(error_msg) if storage else error_msg
+        
         is_share_forbidden = "error_code: 115" in error_msg
         
         if is_share_forbidden:
-            error_msg = "该分享链接已失效（文件禁止分享）"
             try:
                 storage.remove_task_by_order(task_order)
                 storage._update_task_orders()
@@ -564,10 +683,10 @@ def execute_task():
             except Exception as del_err:
                 broadcast_task_log(f"删除失效任务失败: {str(del_err)}", 'error')
         
-        storage.update_task_status_by_order(task_order, 'error', error_msg)
-        broadcast_task_log(f'执行出错: {error_msg}', 'error')
+        storage.update_task_status_by_order(task_order, 'error', parsed_error)
+        broadcast_task_log(f'执行出错: {parsed_error}', 'error')
         broadcast_task_progress(task_id, 100, 'error')
-        return jsonify({'success': False, 'message': error_msg})
+        return jsonify({'success': False, 'message': parsed_error})
 
 @app.route('/api/users', methods=['GET'])
 @login_required
@@ -627,6 +746,27 @@ def switch_user():
             
             # 重新初始化应用
             init_app()
+            
+            # 切换用户后立即获取用户配额信息
+            try:
+                if storage and hasattr(storage, 'get_user_info'):
+                    user_info = storage.get_user_info()
+                    if user_info and 'quota' in user_info:
+                        quota = user_info['quota']
+                        total_gb = round(quota.get('total', 0) / (1024**3), 2)
+                        used_gb = round(quota.get('used', 0) / (1024**3), 2)
+                        logger.info(f"已切换到用户: {username}，网盘总空间: {total_gb}GB, 已使用: {used_gb}GB")
+                        
+                        # 将配额信息添加到用户数据中
+                        user['quota'] = {
+                            'total': quota.get('total', 0),
+                            'used': quota.get('used', 0),
+                            'total_gb': total_gb,
+                            'used_gb': used_gb,
+                            'percent': round(quota.get('used', 0) / quota.get('total', 1) * 100, 2) if quota.get('total', 0) > 0 else 0
+                        }
+            except Exception as e:
+                logger.error(f"切换用户后获取配额信息失败: {str(e)}")
             
             # 返回更新后的状态
             return jsonify({
@@ -733,6 +873,43 @@ def get_user_cookies(username):
     
     return jsonify({'success': True, 'cookies': user_info.get('cookies', '')})
 
+@app.route('/api/user/quota', methods=['GET'])
+@login_required
+@handle_api_error
+def get_user_quota():
+    """获取当前用户的网盘配额信息"""
+    if not storage:
+        return jsonify({'success': False, 'message': '存储未初始化'})
+        
+    try:
+        # 获取用户信息，包括配额
+        user_info = storage.get_user_info()
+        if not user_info or 'quota' not in user_info:
+            return jsonify({'success': False, 'message': '无法获取用户配额信息'})
+            
+        # 提取配额信息
+        quota = user_info['quota']
+        total = quota.get('total', 0)
+        used = quota.get('used', 0)
+        
+        # 转换为GB并保留2位小数
+        total_gb = round(total / (1024**3), 2)
+        used_gb = round(used / (1024**3), 2)
+        
+        return jsonify({
+            'success': True, 
+            'quota': {
+                'total': total,
+                'used': used,
+                'total_gb': total_gb,
+                'used_gb': used_gb,
+                'percent': round(used / total * 100, 2) if total > 0 else 0
+            }
+        })
+    except Exception as e:
+        logger.error(f"获取用户配额失败: {str(e)}")
+        return jsonify({'success': False, 'message': f'获取用户配额失败: {str(e)}'})
+
 @app.route('/api/config', methods=['GET'])
 @login_required
 @handle_api_error
@@ -751,11 +928,33 @@ def get_config():
         'cron': storage.config.get('cron', {}),
         'notify': storage.config.get('notify', {}),
         'scheduler': storage.config.get('scheduler', {}),
+        'quota_alert': storage.config.get('quota_alert', {}),
+        'share': storage.config.get('share', {}),
+        'file_operations': storage.config.get('file_operations', {}),
         'baidu': {
             'current_user': current_user  # 返回完整的用户信息
         }
     }
     return jsonify({'success': True, 'config': config})
+
+def format_webhook_body(webhook_body):
+    """格式化WEBHOOK_BODY字段，将简化格式转换为标准多行格式"""
+    if not webhook_body or isinstance(webhook_body, dict):
+        return webhook_body
+    
+    # 检测是否是简化格式（如：title: "$title"content: "$content"source: "我的项目"）
+    import re
+    simple_format = re.match(r'title:\s*"([^"]*)"content:\s*"([^"]*)"source:\s*"([^"]*)"', webhook_body)
+    
+    if simple_format:
+        # 转换为标准多行格式
+        title = simple_format.group(1)
+        content = simple_format.group(2)
+        source = simple_format.group(3)
+        return f'title: "{title}"\ncontent: "{content}"\nsource: "{source}"'
+    
+    # 如果不是简化格式，直接返回原始值
+    return webhook_body
 
 @app.route('/api/config/update', methods=['POST'])
 @login_required
@@ -766,6 +965,13 @@ def update_config():
         return jsonify({'success': False, 'message': '存储未初始化'})
         
     data = request.get_json()
+    
+    # 自动格式化WEBHOOK_BODY字段
+    if 'notify' in data and 'direct_fields' in data['notify']:
+        direct_fields = data['notify']['direct_fields']
+        if 'WEBHOOK_BODY' in direct_fields:
+            direct_fields['WEBHOOK_BODY'] = format_webhook_body(direct_fields['WEBHOOK_BODY'])
+    
     storage.config.update(data)
     storage._save_config()
     
@@ -902,7 +1108,9 @@ def execute_all_tasks():
                 task['url'],
                 task.get('pwd'),
                 None,
-                task.get('save_dir')
+                task.get('save_dir'),
+                None,  # progress_callback
+                task   # task_config
             )
             
             if result.get('success'):
@@ -994,6 +1202,10 @@ def add_notify_field():
     
     if not field_name:
         return jsonify({'success': False, 'message': '字段名称不能为空'})
+    
+    # 自动格式化WEBHOOK_BODY字段
+    if field_name == 'WEBHOOK_BODY':
+        field_value = format_webhook_body(field_value)
         
     notify_config = storage.config.get('notify', {})
     if 'custom_fields' not in notify_config:
@@ -1071,6 +1283,9 @@ def reorder_task():
 @app.route('/ws')
 def ws():
     """WebSocket连接处理"""
+    if not WEBSOCKET_AVAILABLE:
+        return jsonify({'success': False, 'message': 'WebSocket不可用'}), 400
+        
     if request.environ.get('wsgi.websocket'):
         ws = request.environ['wsgi.websocket']
         clients.add(ws)
@@ -1100,10 +1315,11 @@ def ws():
                 except:
                     pass
                     
-        except WebSocketError as e:
-            logger.warning(f"WebSocket错误: {str(e)}")
         except Exception as e:
-            logger.error(f"WebSocket异常: {str(e)}")
+            if WEBSOCKET_AVAILABLE:
+                logger.error(f"WebSocket异常: {str(e)}")
+            else:
+                logger.error(f"HTTP连接异常: {str(e)}")
         finally:
             try:
                 clients.remove(ws)
@@ -1247,36 +1463,348 @@ def check_version():
     try:
         import feedparser
         import requests
+        from requests.exceptions import RequestException
+        import re
         
-        # 使用 feedparser 解析 GitHub releases feed
-        feed_url = f'https://github.com/{GITHUB_REPO}/releases.atom'
-        response = requests.get(feed_url)
-        if response.status_code != 200:
-            return jsonify({
-                'success': False,
-                'message': '无法获取版本信息'
-            })
-            
-        # 解析 feed
-        feed = feedparser.parse(response.content)
-        if not feed.entries:
-            return jsonify({
-                'success': False,
-                'message': '未找到版本信息'
-            })
-            
-        # 获取最新版本信息
-        latest_version = feed.entries[0].title
+        # 获取查询参数，确定使用哪个源检查更新
+        source = request.args.get('source', 'github')
         
-        return jsonify({
-            'success': True,
-            'version': latest_version
-        })
+        if source == 'dockerhub':
+            # 使用 Docker Hub RSS 检查更新
+            feed_url = DOCKER_HUB_RSS
+        elif source == 'dockerhub_alt':
+            # 使用备用 Docker Hub RSS 源
+            feed_url = DOCKER_HUB_RSS_ALT
+        elif source in ['msrun', '1ms']:
+            # 使用 1ms.run API 获取版本信息
+            try:
+                params = {
+                    "repositories": "kokojacket/baidu-autosave",
+                    "page": 1,
+                    "page_size": 10,
+                    "search": ""
+                }
+                response = requests.get(MS_RUN_API, params=params, timeout=5)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data.get('code') == 0 and data.get('data', {}).get('list'):
+                    # 查找最新的正式版本（格式为vX.Y.Z）
+                    version_tags = []
+                    latest_tag = None
+                    
+                    # 首先找到latest标签
+                    for tag_info in data['data']['list']:
+                        if tag_info['tag_name'] == 'latest':
+                            latest_tag = tag_info
+                            break
+                    
+                    if latest_tag:
+                        # 找到与latest标签具有相同digest的版本标签
+                        latest_digest = latest_tag.get('digest')
+                        for tag_info in data['data']['list']:
+                            if re.match(r'^v\d+\.\d+\.\d+$', tag_info['tag_name']) and tag_info.get('digest') == latest_digest:
+                                version_tags.append(tag_info)
+                    
+                    # 如果没有找到与latest相同digest的版本标签，则收集所有版本标签
+                    if not version_tags:
+                        for tag_info in data['data']['list']:
+                            if re.match(r'^v\d+\.\d+\.\d+$', tag_info['tag_name']):
+                                version_tags.append(tag_info)
+                    
+                    if version_tags:
+                        # 按更新时间排序，选择最新的
+                        version_tags.sort(key=lambda x: x.get('tag_last_pushed', ''), reverse=True)
+                        latest_version = version_tags[0]['tag_name']
+                        published = version_tags[0].get('tag_last_pushed')
+                        link = f"https://hub.docker.com/layers/kokojacket/baidu-autosave/{latest_version}/images/{version_tags[0].get('digest', '').split(':')[-1]}"
+                        
+                        logger.info(f"从1ms.run API获取到最新版本: {latest_version}")
+                        return jsonify({
+                            'success': True,
+                            'version': latest_version,
+                            'published': published,
+                            'link': link,
+                            'source': '1ms'
+                        })
+                
+                # 如果没有找到有效的版本信息，返回错误
+                logger.warning("1ms.run API未返回有效的版本信息")
+                return jsonify({
+                    'success': False,
+                    'message': '1ms.run API未返回有效的版本信息',
+                    'source': '1ms'
+                })
+                
+            except Exception as e:
+                logger.warning(f"从1ms.run API获取版本信息失败: {str(e)}")
+                return jsonify({
+                    'success': False,
+                    'message': f'从1ms.run API获取版本信息失败: {str(e)}',
+                    'source': '1ms'
+                })
+        else:
+            # 默认使用 GitHub releases feed
+            feed_url = f'https://github.com/{GITHUB_REPO}/releases.atom'
+        
+        # 如果是使用RSS源，则执行以下代码
+        if source in ['github', 'dockerhub', 'dockerhub_alt']:
+            try:
+                # 设置超时，避免长时间等待
+                response = requests.get(feed_url, timeout=5)
+                response.raise_for_status()  # 如果响应状态码不是200，抛出异常
+            except RequestException as e:
+                logger.warning(f"获取{source}版本信息失败: {str(e)}")
+                return jsonify({
+                    'success': False,
+                    'message': f'无法获取{source}版本信息: {str(e)}',
+                    'source': source
+                })
+                
+            # 解析 feed
+            feed = feedparser.parse(response.content)
+            if not feed.entries:
+                logger.warning(f"{source}未找到版本信息")
+                return jsonify({
+                    'success': False,
+                    'message': f'{source}未找到版本信息',
+                    'source': source
+                })
+                
+            # 获取最新版本信息
+            if source in ['dockerhub', 'dockerhub_alt']:
+                # 首先查找latest标签的条目
+                latest_entry = None
+                latest_guid = None
+                version_entry = None
+                
+                for entry in feed.entries:
+                    if ':latest' in entry.title:
+                        latest_entry = entry
+                        # 提取镜像ID（guid的@后面部分）
+                        guid_match = re.search(r'@([a-f0-9]+)$', entry.guid)
+                        if guid_match:
+                            latest_guid = guid_match.group(1)
+                        break
+                
+                if not latest_entry:
+                    logger.warning("Docker Hub中未找到latest标签")
+                    # 如果没有找到latest标签，使用第一个条目
+                    latest_entry = feed.entries[0]
+                
+                # 如果找到了latest的guid，查找对应的版本号条目
+                if latest_guid:
+                    for entry in feed.entries:
+                        # 检查是否是版本号标签（如v1.0.8）并且与latest有相同的guid
+                        if re.search(r':v\d+\.\d+\.\d+', entry.title) and latest_guid in entry.guid:
+                            version_entry = entry
+                            break
+                
+                # 如果找到了版本号条目，使用它；否则使用latest条目
+                entry_to_use = version_entry if version_entry else latest_entry
+                
+                # 提取版本号
+                title = entry_to_use.title
+                version_match = re.search(r':(?:v?\d+\.\d+\.\d+|latest)', title)
+                latest_version = version_match.group(0)[1:] if version_match else title
+                
+                # 添加发布日期
+                pub_date = entry_to_use.pubDate if hasattr(entry_to_use, 'pubDate') else entry_to_use.published
+                
+                logger.info(f"从Docker Hub ({source})获取到最新版本: {latest_version}")
+                return jsonify({
+                    'success': True,
+                    'version': latest_version,
+                    'published': pub_date,
+                    'link': entry_to_use.link,
+                    'source': source
+                })
+            else:
+                # GitHub 格式
+                title = feed.entries[0].title
+                
+                # 从标题中提取版本号，支持多种格式：
+                # 1. "Release v1.0.8" -> "v1.0.8"
+                # 2. "v1.0.8" -> "v1.0.8"
+                # 3. "1.0.8" -> "1.0.8"
+                version_match = re.search(r'(?:Release\s+)?(v?\d+\.\d+\.\d+)', title)
+                if version_match:
+                    latest_version = version_match.group(1)
+                    # 确保版本号以v开头
+                    if not latest_version.startswith('v'):
+                        latest_version = 'v' + latest_version
+                else:
+                    # 如果无法提取版本号，使用原始标题
+                    latest_version = title
+                
+                pub_date = feed.entries[0].published if hasattr(feed.entries[0], 'published') else None
+                link = feed.entries[0].link if hasattr(feed.entries[0], 'link') else f"https://github.com/{GITHUB_REPO}/releases/latest"
+                
+                logger.info(f"从GitHub获取到最新版本: {title} -> 提取版本号: {latest_version}")
+                return jsonify({
+                    'success': True,
+                    'version': latest_version,
+                    'published': pub_date,
+                    'link': link,
+                    'source': 'github'
+                })
     except Exception as e:
+        logger.error(f"检查版本失败: {str(e)}")
         return jsonify({
             'success': False,
-            'message': f'检查版本失败: {str(e)}'
+            'message': f'检查版本失败: {str(e)}',
+            'source': source if 'source' in locals() else 'unknown'
         })
+
+# 添加轮询API端点
+@app.route('/api/tasks/status', methods=['GET'])
+@login_required
+@handle_api_error
+def get_tasks_status():
+    """获取所有任务的状态（用于轮询）"""
+    if not storage:
+        return jsonify({'success': False, 'message': '存储未初始化'})
+    tasks = storage.list_tasks()
+    # 按 order 排序，没有 order 的排在最后
+    tasks.sort(key=lambda x: x.get('order', float('inf')))
+    return jsonify({'success': True, 'tasks': tasks})
+
+@app.route('/api/logs', methods=['GET'])
+@login_required
+@handle_api_error
+def get_logs():
+    """获取最近的日志（用于轮询）"""
+    # 获取查询参数
+    limit = request.args.get('limit', 20, type=int)
+    
+    # 从日志文件中读取最新的日志
+    log_entries = []
+    try:
+        today = datetime.now().strftime('%Y-%m-%d')
+        log_file = f"log/web_app_{today}.log"
+        
+        if os.path.exists(log_file):
+            with open(log_file, 'r', encoding='utf-8') as f:
+                # 读取最后limit行
+                lines = f.readlines()
+                last_lines = lines[-limit:] if len(lines) > limit else lines
+                
+                for line in last_lines:
+                    # 解析日志格式
+                    try:
+                        parts = line.split('|')
+                        if len(parts) >= 3:
+                            timestamp = parts[0].strip()
+                            level = parts[1].strip()
+                            message = '|'.join(parts[2:]).strip()
+                            
+                            log_entries.append({
+                                'timestamp': timestamp,
+                                'level': level,
+                                'message': message
+                            })
+                    except:
+                        # 如果解析失败，添加原始行
+                        log_entries.append({
+                            'timestamp': '',
+                            'level': 'INFO',
+                            'message': line.strip()
+                        })
+    except Exception as e:
+        logger.error(f"读取日志文件失败: {str(e)}")
+        return jsonify({'success': False, 'message': f'读取日志文件失败: {str(e)}'})
+    
+    return jsonify({'success': True, 'logs': log_entries})
+
+@app.route('/api/task/log/<int:task_id>', methods=['GET'])
+@login_required
+@handle_api_error
+def get_task_log(task_id):
+    """获取指定任务的执行日志（用于轮询）"""
+    # 这里我们返回一个空列表，因为我们没有为每个任务单独存储日志
+    # 在实际应用中，可以考虑为每个任务添加日志存储
+    return jsonify({'success': True, 'logs': []})
+
+@app.route('/api/task/share', methods=['POST'])
+@login_required
+@handle_api_error
+def share_task():
+    """生成任务的分享链接"""
+    if not storage:
+        return jsonify({'success': False, 'message': '存储未初始化'})
+    
+    data = request.get_json()
+    task_id = data.get('task_id')
+    custom_password = data.get('password')  # 可选的自定义密码
+    custom_period = data.get('period')      # 可选的自定义有效期
+    
+    if task_id is None:
+        return jsonify({'success': False, 'message': '任务ID不能为空'})
+    
+    # 获取任务信息
+    tasks = storage.list_tasks()
+    tasks.sort(key=lambda x: x.get('order', float('inf')))
+    
+    if 0 <= task_id < len(tasks):
+        task = tasks[task_id]
+        save_dir = task.get('save_dir')
+        
+        if not save_dir:
+            return jsonify({'success': False, 'message': '任务保存目录为空'})
+        
+        # 获取分享配置
+        share_config = storage.config.get('share', {})
+        password = custom_password or share_config.get('default_password', '1234')
+        period_days = custom_period or share_config.get('default_period_days', 7)
+        
+        try:
+            # 调用BaiduPCS-Py的share命令
+            # 注意：share_file函数内部会检查并创建目录
+            share_result = storage.share_file(save_dir, password, period_days)
+            
+            if share_result.get('success'):
+                share_info = share_result.get('share_info', {})
+                
+                # 更新任务的分享信息
+                task_order = task.get('order', task_id + 1)
+                storage.update_task_share_info(task_order, share_info)
+                
+                return jsonify({
+                    'success': True, 
+                    'message': '分享链接生成成功',
+                    'share_info': share_info
+                })
+            else:
+                return jsonify({
+                    'success': False, 
+                    'message': share_result.get('error', '分享链接生成失败')
+                })
+                
+        except Exception as e:
+            logger.error(f"生成分享链接失败: {str(e)}")
+            return jsonify({'success': False, 'message': f'生成分享链接失败: {str(e)}'})
+    else:
+        return jsonify({'success': False, 'message': '任务不存在'})
+
+@app.route('/api/config/share', methods=['POST'])
+@login_required
+@handle_api_error
+def update_share_config():
+    """更新分享配置"""
+    if not storage:
+        return jsonify({'success': False, 'message': '存储未初始化'})
+        
+    data = request.get_json()
+    share_config = {
+        'default_password': data.get('default_password', '1234'),
+        'default_period_days': data.get('default_period_days', 7)
+    }
+    
+    # 更新配置
+    storage.config['share'] = share_config
+    storage._save_config()
+    
+    return jsonify({'success': True, 'message': '分享配置已更新'})
 
 if __name__ == '__main__':
     try:
@@ -1291,8 +1819,14 @@ if __name__ == '__main__':
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
         
-        # 使用gevent-websocket替代默认的服务器
-        http_server = WSGIServer(('0.0.0.0', 5000), app, handler_class=WebSocketHandler)
+        # 根据是否支持WebSocket选择合适的服务器
+        if WEBSOCKET_AVAILABLE:
+            logger.info("使用支持WebSocket的服务器")
+            http_server = WSGIServer(('0.0.0.0', 5000), app, handler_class=WebSocketHandler, log=None)  # 禁用访问日志
+        else:
+            logger.info("使用标准WSGI服务器")
+            http_server = WSGIServer(('0.0.0.0', 5000), app, log=None)  # 禁用访问日志
+            
         print('Server started at http://0.0.0.0:5000')
         http_server.serve_forever()
     except KeyboardInterrupt:
