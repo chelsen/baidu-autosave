@@ -10,7 +10,63 @@ import posixpath
 from threading import Lock
 import traceback
 import subprocess
+import shutil
 import json
+import random
+from functools import wraps
+
+def _format_transfer_error(error_str):
+    """格式化转存错误信息，将百度API返回的模糊错误信息转换为更清晰的提示"""
+    if "error_code: 4" in error_str or "存储好像出问题了" in error_str:
+        return "转存错误"
+    return error_str
+
+def api_retry(max_retries=1, delay_range=(2, 3), exclude_errors=None):
+    """
+    API重试装饰器
+    Args:
+        max_retries: 最大重试次数（默认1次，即总共执行2次）
+        delay_range: 重试延迟范围（秒），默认2-3秒
+        exclude_errors: 不需要重试的错误码列表
+    """
+    if exclude_errors is None:
+        exclude_errors = [-6, 115, 145, 200025, -9]  # 身份验证失败、分享链接失效、提取码错误、文件不存在
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+
+            for attempt in range(max_retries + 1):  # +1 因为包含原始请求
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    error_str = str(e)
+
+                    # 检查是否是不需要重试的错误
+                    should_skip_retry = False
+                    for error_code in exclude_errors:
+                        if f"error_code: {error_code}" in error_str or f"errno: {error_code}" in error_str:
+                            should_skip_retry = True
+                            break
+
+                    # 如果是最后一次尝试或者是不需要重试的错误，直接抛出异常
+                    if attempt == max_retries or should_skip_retry:
+                        if should_skip_retry:
+                            logger.debug(f"API调用失败，错误不需要重试: {error_str}")
+                        raise e
+
+                    # 记录重试信息
+                    delay = random.uniform(delay_range[0], delay_range[1])
+                    logger.warning(f"API调用失败，{delay:.1f}秒后进行第{attempt + 1}次重试: {error_str}")
+                    time.sleep(delay)
+
+            # 如果所有重试都失败了，抛出最后一个异常
+            raise last_exception
+
+        return wrapper
+    return decorator
 
 class BaiduStorage:
     def __init__(self):
@@ -27,9 +83,14 @@ class BaiduStorage:
         self._user_info_cache = None
         self._user_info_cache_time = 0
         self._cache_ttl = 30  # 缓存有效期（秒）
-
+        
     def _load_config(self):
         try:
+            # 检查配置文件是否存在且不为空
+            if not os.path.exists('config/config.json') or os.path.getsize('config/config.json') == 0:
+                logger.warning("配置文件不存在或为空，将从模板创建")
+                self._create_config_from_template()
+
             with open('config/config.json', 'r', encoding='utf-8') as f:
                 config = json.load(f)
                 # 确保配置文件结构完整
@@ -74,7 +135,41 @@ class BaiduStorage:
         except Exception as e:
             logger.error(f"加载配置文件失败: {str(e)}")
             raise
-            
+
+    def _create_config_from_template(self):
+        """从模板创建配置文件"""
+        try:
+            # 查找模板文件
+            template_paths = [
+                'config/config.template.json',
+                'template/config.template.json'
+            ]
+
+            template_path = None
+            for path in template_paths:
+                if os.path.exists(path):
+                    template_path = path
+                    break
+
+            if not template_path:
+                logger.error("找不到配置模板文件")
+                raise FileNotFoundError("配置模板文件不存在")
+
+            # 备份现有配置文件（如果存在）
+            if os.path.exists('config/config.json'):
+                backup_path = f'config/config.json.backup.{int(time.time())}'
+                shutil.copy2('config/config.json', backup_path)
+                logger.info(f"已备份现有配置文件到: {backup_path}")
+
+            # 从模板复制配置文件
+            os.makedirs('config', exist_ok=True)
+            shutil.copy2(template_path, 'config/config.json')
+            logger.info(f"已从模板 {template_path} 创建配置文件")
+
+        except Exception as e:
+            logger.error(f"从模板创建配置文件失败: {str(e)}")
+            raise
+
     def _save_config(self, update_scheduler=True):
         """保存配置到文件"""
         try:
@@ -126,7 +221,7 @@ class BaiduStorage:
                     
                 # 清除用户信息缓存
                 self._clear_user_info_cache()
-
+                
                 # 使用重试机制初始化客户端
                 for retry in range(3):
                     try:
@@ -271,7 +366,7 @@ class BaiduStorage:
         self._user_info_cache = None
         self._user_info_cache_time = 0
         logger.debug("已清除用户信息缓存")
-
+        
     def switch_user(self, username):
         """切换当前用户"""
         try:
@@ -283,7 +378,7 @@ class BaiduStorage:
             self._init_client()
             # 清除用户信息缓存
             self._clear_user_info_cache()
-
+            
             logger.success(f"已切换到用户: {username}")
             return True
             
@@ -333,11 +428,11 @@ class BaiduStorage:
             
             # 检查缓存是否有效
             current_time = time.time()
-            if (self._user_info_cache is not None and
+            if (self._user_info_cache is not None and 
                 current_time - self._user_info_cache_time < self._cache_ttl):
                 logger.debug("使用缓存的用户信息，跳过API调用")
                 return self._user_info_cache
-
+            
             # 首先尝试获取配额信息
             try:
                 quota_info = self.client.quota()
@@ -370,12 +465,12 @@ class BaiduStorage:
                     # 更新缓存
                     self._user_info_cache = user_info
                     self._user_info_cache_time = current_time
-
+                    
                     return user_info
-
+                    
                 except Exception as e:
                     logger.warning(f"获取用户详细信息失败: {str(e)}")
-
+                    
                     # 即使获取详细信息失败，也缓存基本配额信息
                     user_info = {
                         'user_name': '未知用户',
@@ -384,9 +479,9 @@ class BaiduStorage:
                     }
                     self._user_info_cache = user_info
                     self._user_info_cache_time = current_time
-
+                    
                     return user_info
-
+                    
             except Exception as e:
                 logger.error(f"获取网盘信息失败: {str(e)}")
                 return None
@@ -514,6 +609,20 @@ class BaiduStorage:
             # 移除URL中的hash部分
             url = url.split('#')[0]
             
+            # 处理第二种格式: https://pan.baidu.com/share/init?surl=xxx&pwd=xxx
+            # 注意：这里不处理pwd参数，因为pwd由调用方传入
+            if '/share/init?' in url and 'surl=' in url:
+                import urllib.parse
+                parsed = urllib.parse.urlparse(url)
+                params = urllib.parse.parse_qs(parsed.query)
+
+                # 提取surl参数
+                surl = params.get('surl', [''])[0]
+
+                # 转换为第一种格式
+                if surl:
+                    url = f"https://pan.baidu.com/s/{surl}"
+
             # 验证URL格式（更新正则表达式以适应可能的查询参数）
             if not re.match(r'^https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+(?:\?pwd=[a-zA-Z0-9]+)?$', url):
                 raise ValueError("无效的百度网盘分享链接格式")
@@ -540,7 +649,7 @@ class BaiduStorage:
             if regex_pattern:
                 new_task['regex_pattern'] = regex_pattern.strip()
                 new_task['regex_replace'] = regex_replace.strip() if regex_replace else ''
-
+            
             # 添加任务
             tasks = self.config['baidu'].get('tasks', [])
             tasks.append(new_task)
@@ -611,26 +720,30 @@ class BaiduStorage:
             logger.error(f"标准化路径失败: {str(e)}")
             return path
 
-    def _ensure_dir_exists(self, path):
+    def _ensure_dir_exists(self, path, client=None):
         """确保目录存在，如果不存在则创建
         Args:
             path: 目录路径
+            client: 客户端实例，默认为None则使用self.client
         Returns:
             bool: 是否成功
         """
         try:
+            if client is None:
+                client = self.client
+
             path = self._normalize_path(path)
-            
+
             # 检查目录是否存在
             try:
-                self.client.list(path)
+                client.list(path)
                 logger.debug(f"目录已存在: {path}")
                 return True
             except Exception as e:
                 if 'error_code: 31066' in str(e):  # 目录不存在
                     logger.info(f"目录不存在，开始创建: {path}")
                     try:
-                        self.client.makedir(path)
+                        client.makedir(path)
                         logger.success(f"创建目录成功: {path}")
                         return True
                     except Exception as create_e:
@@ -645,9 +758,9 @@ class BaiduStorage:
                             parent_dir = os.path.dirname(path)
                             if parent_dir and parent_dir != '/':
                                 logger.info(f"需要先创建父目录: {parent_dir}")
-                                if self._ensure_dir_exists(parent_dir):
+                                if self._ensure_dir_exists(parent_dir, client=client):
                                     # 父目录创建成功，重试创建当前目录
-                                    return self._ensure_dir_exists(path)
+                                    return self._ensure_dir_exists(path, client=client)
                                 else:
                                     logger.error(f"创建父目录失败: {parent_dir}")
                                     return False
@@ -659,43 +772,47 @@ class BaiduStorage:
                 else:
                     logger.error(f"检查目录失败: {path}, 错误: {str(e)}")
                     return False
-                    
+
         except Exception as e:
             logger.error(f"确保目录存在时发生错误: {path}, 错误: {str(e)}")
             return False
 
-    def _ensure_dir_tree_exists(self, path):
+    def _ensure_dir_tree_exists(self, path, client=None):
         """确保目录树存在，会检查并创建所有必要的父目录
         Args:
             path: 目录路径
+            client: 客户端实例，默认为None则使用self.client
         Returns:
             bool: 是否成功
         """
         try:
+            if client is None:
+                client = self.client
+
             path = self._normalize_path(path)
-            
+
             # 如果目录已存在，直接返回成功
             try:
-                self.client.list(path)
+                client.list(path)
                 logger.debug(f"目录已存在: {path}")
                 return True
             except:
                 pass
-                
+
             # 分解路径
             parts = path.strip('/').split('/')
             current_path = ''
-            
+
             # 逐级检查和创建目录
             for part in parts:
                 if not part:
                     continue
                 current_path = self._normalize_path(current_path + '/' + part)
-                if not self._ensure_dir_exists(current_path):
+                if not self._ensure_dir_exists(current_path, client=client):
                     return False
-                    
+
             return True
-            
+
         except Exception as e:
             logger.error(f"创建目录树失败: {str(e)}")
             return False
@@ -718,7 +835,7 @@ class BaiduStorage:
                 return code, msg
                 
         return None, error_str
-
+    
     def _parse_share_error(self, error_str):
         """解析分享链接相关的错误信息，返回用户友好的错误消息
         Args:
@@ -730,22 +847,22 @@ class BaiduStorage:
             # 检查错误码115（分享文件禁止分享）
             if 'error_code: 115' in error_str:
                 return '分享链接已失效（文件禁止分享）'
-
+            
             # 检查错误码145或errno: 145（分享链接失效）
             if 'error_code: 145' in error_str or "'errno': 145" in error_str:
                 return '分享链接已失效'
-
+            
             # 检查错误码200025（提取码错误）
             if 'error_code: 200025' in error_str or "'errno': 200025" in error_str:
                 return '提取码输入错误，请检查提取码'
-
+            
             # 检查其他常见分享错误
             if 'share' in error_str.lower() and 'not found' in error_str.lower():
                 return '分享链接不存在或已失效'
-
+                
             if 'password' in error_str.lower() and 'wrong' in error_str.lower():
                 return '提取码错误'
-
+                
             # 如果包含复杂的JSON错误信息，尝试简化
             if '{' in error_str and 'errno' in error_str:
                 # 尝试提取错误码
@@ -761,14 +878,14 @@ class BaiduStorage:
                         return '分享链接已失效（文件禁止分享）'
                     else:
                         return f'分享链接访问失败（错误码：{errno}）'
-
+            
             # 如果没有匹配到特定错误，返回简化后的原始错误
             # 移除复杂的JSON信息
             if len(error_str) > 200 and '{' in error_str:
                 return '分享链接访问失败，请检查链接和提取码'
-
+            
             return error_str
-
+            
         except Exception as e:
             logger.debug(f"解析分享错误信息失败: {str(e)}")
             return '分享链接访问失败，请检查链接和提取码'
@@ -813,11 +930,11 @@ class BaiduStorage:
             # 获取正则规则
             pattern = task_config.get('regex_pattern', '')
             replace = task_config.get('regex_replace', '')
-
+            
             if not pattern:
                 # 没有规则，直接返回原文件
                 return True, file_path
-
+            
             try:
                 # 1. 尝试匹配
                 match = re.search(pattern, file_path)
@@ -825,7 +942,7 @@ class BaiduStorage:
                     # 匹配失败 = 文件被过滤掉
                     logger.debug(f"文件被正则规则过滤: {file_path} (规则: {pattern})")
                     return False, file_path
-
+                
                 # 2. 匹配成功，检查是否需要重命名
                 if replace and replace.strip():
                     # 有替换内容，执行重命名
@@ -833,15 +950,15 @@ class BaiduStorage:
                     if new_path != file_path:
                         logger.debug(f"正则重命名: {file_path} -> {new_path}")
                         return True, new_path
-
+                
                 # 3. 匹配成功但无重命名，返回原路径
                 return True, file_path
-
+                
             except re.error as e:
                 logger.warning(f"正则表达式错误: {pattern}, 错误: {str(e)}")
                 # 正则错误时不过滤，返回原文件
                 return True, file_path
-
+            
         except Exception as e:
             logger.error(f"应用正则规则时出错: {str(e)}")
             # 出错时返回原始路径，不影响正常流程
@@ -866,6 +983,24 @@ class BaiduStorage:
             }
         """
         try:
+            # 创建临时客户端用于本次任务执行
+            logger.info("创建临时客户端用于任务执行")
+            current_user = self.config['baidu'].get('current_user')
+            if not current_user:
+                return {'success': False, 'error': '未设置当前用户'}
+
+            user_info = self.config['baidu']['users'].get(current_user)
+            if not user_info or not user_info.get('cookies'):
+                return {'success': False, 'error': f'用户 {current_user} 配置无效'}
+
+            cookies = self._parse_cookies(user_info['cookies'])
+            if not self._validate_cookies(cookies):
+                return {'success': False, 'error': 'cookies 无效'}
+
+            # 创建临时客户端
+            temp_client = BaiduPCSApi(cookies=cookies)
+            logger.info("临时客户端创建成功")
+
             # 规范化保存路径
             if save_dir and not save_dir.startswith('/'):
                 save_dir = '/' + save_dir
@@ -881,11 +1016,11 @@ class BaiduStorage:
                     logger.info(f"使用密码 {pwd} 访问分享链接")
                 if progress_callback:
                         progress_callback('info', f'使用密码访问分享链接')
-                self.client.access_shared(share_url, pwd)
-                
+                self._access_shared_with_retry(share_url, pwd, client=temp_client)
+
                 # 步骤1.1：获取分享文件列表并记录
                 logger.info("获取分享文件列表...")
-                shared_paths = self.client.shared_paths(shared_url=share_url)
+                shared_paths = self._shared_paths_with_retry(shared_url=share_url, client=temp_client)
                 if not shared_paths:
                     logger.error("获取分享文件列表失败")
                     if progress_callback:
@@ -894,19 +1029,19 @@ class BaiduStorage:
                 
                 # 记录分享文件信息
                 logger.info(f"成功获取分享文件列表，共 {len(shared_paths)} 项")
-
+                
                 # 获取分享信息
                 uk = shared_paths[0].uk
                 share_id = shared_paths[0].share_id
                 bdstoken = shared_paths[0].bdstoken
-
+                
                 # 记录共享文件详情
                 shared_files_info = []
                 for path in shared_paths:
                     if path.is_dir:
                         logger.info(f"记录共享文件夹: {path.path}")
                         # 获取文件夹内容
-                        folder_files = self._list_shared_dir_files(path, uk, share_id, bdstoken)
+                        folder_files = self._list_shared_dir_files(path, uk, share_id, bdstoken, client=temp_client)
                         for file_info in folder_files:
                             shared_files_info.append(file_info)
                             logger.debug(f"记录共享文件: {file_info['path']}")
@@ -923,19 +1058,19 @@ class BaiduStorage:
                 logger.info(f"共记录 {len(shared_files_info)} 个共享文件")
                 if progress_callback:
                     progress_callback('info', f'获取到 {len(shared_files_info)} 个共享文件')
-
+                
                 # 步骤2：扫描本地目录中的文件
                 logger.info(f"【步骤2/4】扫描本地目录: {save_dir}")
                 if progress_callback:
                     progress_callback('info', f'【步骤2/4】扫描本地目录: {save_dir}')
-
+                
                 # 获取本地文件列表
                 local_files = []
                 if save_dir:
-                    local_files = self.list_local_files(save_dir)
+                    local_files = self.list_local_files(save_dir, client=temp_client)
                     if progress_callback:
                         progress_callback('info', f'本地目录中有 {len(local_files)} 个文件')
-
+                
                 # 步骤3：准备转存（对比文件、准备目录）
                 target_dir = save_dir
                 is_single_folder = (
@@ -958,11 +1093,11 @@ class BaiduStorage:
                     clean_path = file_info['path']
                     if is_single_folder and '/' in clean_path:
                         clean_path = '/'.join(clean_path.split('/')[1:])
-
+                    
                     # 🔄 新逻辑：先应用正则规则
                     should_transfer = True
                     final_path = clean_path
-
+                    
                     if task_config:
                         should_transfer, final_path = self._apply_regex_rules(clean_path, task_config)
                         if not should_transfer:
@@ -970,16 +1105,16 @@ class BaiduStorage:
                             if progress_callback:
                                 progress_callback('info', f'文件被正则过滤掉: {clean_path}')
                             continue
-
+                    
                     # 🔄 改进的去重检查逻辑
                     clean_normalized = self._normalize_path(clean_path, file_only=True)
                     final_normalized = self._normalize_path(final_path, file_only=True)
-
+                    
                     # 检查原文件是否存在
                     original_exists = clean_normalized in local_files
-                    # 检查重命名后文件是否存在
+                    # 检查重命名后文件是否存在  
                     final_exists = final_normalized in local_files
-
+                    
                     if final_path != clean_path:  # 需要重命名
                         if original_exists and not final_exists:
                             # 原文件存在但重命名后的不存在 = 仅需重命名，不需转存
@@ -1002,7 +1137,7 @@ class BaiduStorage:
                             if progress_callback:
                                 progress_callback('info', f'文件已存在，跳过: {final_path}')
                             continue
-
+                    
                     # 检查是否在指定的文件列表中（使用原始路径检查）
                     if new_files is None or clean_path in new_files:
                         # 🔄 转存时用原始目录路径，重命名在转存后处理
@@ -1012,7 +1147,7 @@ class BaiduStorage:
                             dir_path = posixpath.dirname(target_path).replace('\\', '/')
                             need_rename = (final_path != clean_path)
                             transfer_list.append((file_info['fs_id'], dir_path, clean_path, final_path, need_rename))
-
+                            
                             # 日志显示重命名信息
                             if need_rename:
                                 logger.info(f"需要转存文件: {clean_path} -> {final_path}")
@@ -1022,7 +1157,7 @@ class BaiduStorage:
                                 logger.info(f"需要转存文件: {final_path}")
                                 if progress_callback:
                                     progress_callback('info', f'需要转存文件: {final_path}')
-
+                
                 # 处理仅需重命名的文件（无需转存）
                 rename_only_success = []
                 failed_rename_only = []  # 收集失败的重命名任务
@@ -1030,17 +1165,17 @@ class BaiduStorage:
                     logger.info(f"=== 处理仅需重命名的文件（{len(rename_only_list)}个）===")
                     if progress_callback:
                         progress_callback('info', f'处理仅需重命名的文件: {len(rename_only_list)}个')
-
+                    
                     for _, dir_path, clean_path, final_path, _ in rename_only_list:
                         retry_count = 0
                         max_retries = 1
                         delay_seconds = self.config.get('file_operations', {}).get('rename_delay_seconds', 0.5)
-
+                        
                         while retry_count <= max_retries:
                             try:
                                 original_full_path = posixpath.join(dir_path, os.path.basename(clean_path))
                                 final_full_path = posixpath.join(dir_path, os.path.basename(final_path))
-
+                                
                                 if retry_count == 0:
                                     logger.info(f"重命名已存在的文件: {original_full_path} -> {final_full_path}")
                                     if progress_callback:
@@ -1049,18 +1184,18 @@ class BaiduStorage:
                                     logger.info(f"重试重命名文件: {original_full_path} -> {final_full_path} (第{retry_count}次重试)")
                                     if progress_callback:
                                         progress_callback('info', f'重试重命名: {os.path.basename(clean_path)} -> {os.path.basename(final_path)}')
-
-                                self.client.rename(original_full_path, final_full_path)
+                                
+                                temp_client.rename(original_full_path, final_full_path)
                                 logger.success(f"重命名成功: {clean_path} -> {final_path}")
                                 rename_only_success.append(final_path)
-
+                                
                                 # 添加延迟避免API频率限制
                                 if delay_seconds > 0:
                                     logger.debug(f"延迟 {delay_seconds} 秒以避免API频率限制")
                                     time.sleep(delay_seconds)
-
+                                
                                 break  # 成功后跳出重试循环
-
+                                
                             except Exception as e:
                                 retry_count += 1
                                 if retry_count <= max_retries:
@@ -1090,7 +1225,7 @@ class BaiduStorage:
                         'message': f'仅重命名操作完成，共处理 {len(rename_only_success)} 个文件',
                         'transferred_files': rename_only_success
                     }
-
+                
                 if progress_callback:
                     progress_callback('info', f'找到 {len(transfer_list)} 个新文件需要转存')
                 
@@ -1100,7 +1235,7 @@ class BaiduStorage:
                 for _, dir_path, _, _, _ in transfer_list:
                     if dir_path not in created_dirs:
                         logger.info(f"检查目录: {dir_path}")
-                        if not self._ensure_dir_exists(dir_path):
+                        if not self._ensure_dir_exists(dir_path, client=temp_client):
                             logger.error(f"创建目录失败: {dir_path}")
                             if progress_callback:
                                 progress_callback('error', f'创建目录失败: {dir_path}')
@@ -1112,7 +1247,7 @@ class BaiduStorage:
                 logger.info(f"共需转存 {len(transfer_list)} 个文件")
                 if progress_callback:
                     progress_callback('info', f'【步骤4/4】开始执行转存操作，共 {len(transfer_list)} 个文件')
-
+                
                 # 按目录分组进行转存
                 success_count = 0
                 grouped_transfers = {}
@@ -1133,14 +1268,15 @@ class BaiduStorage:
                     try:
                         logger.info(f"开始执行转存操作: 正在将 {len(fs_ids)} 个文件转存到 {dir_path}")
                         # 确保客户端和参数都有效
-                        if self.client and uk is not None and share_id is not None and bdstoken is not None:
-                            self.client.transfer_shared_paths(
+                        if temp_client and uk is not None and share_id is not None and bdstoken is not None:
+                            self._transfer_shared_paths_with_retry(
                                 remotedir=dir_path,
                                 fs_ids=fs_ids,
                                 uk=int(uk),
                                 share_id=int(share_id),
                                 bdstoken=str(bdstoken),
-                                shared_url=share_url
+                                shared_url=share_url,
+                                client=temp_client
                             )
                         else:
                             error_msg = "转存失败: 客户端或参数无效"
@@ -1160,14 +1296,15 @@ class BaiduStorage:
                             try:
                                 logger.info(f"重试转存操作: 正在将 {len(fs_ids)} 个文件转存到 {dir_path}")
                                 # 确保客户端和参数都有效
-                                if self.client and uk is not None and share_id is not None and bdstoken is not None:
-                                    self.client.transfer_shared_paths(
+                                if temp_client and uk is not None and share_id is not None and bdstoken is not None:
+                                    self._transfer_shared_paths_with_retry(
                                         remotedir=dir_path,
                                         fs_ids=fs_ids,
                                         uk=int(uk),
                                         share_id=int(share_id),
                                         bdstoken=str(bdstoken),
-                                        shared_url=share_url
+                                        shared_url=share_url,
+                                        client=temp_client
                                     )
                                 else:
                                     error_msg = "重试转存失败: 客户端或参数无效"
@@ -1178,15 +1315,17 @@ class BaiduStorage:
                                 if progress_callback:
                                     progress_callback('success', f'重试成功: {dir_path}')
                             except Exception as retry_e:
-                                logger.error(f"重试转存失败: {dir_path} - {str(retry_e)}")
+                                error_msg = _format_transfer_error(str(retry_e))
+                                logger.error(f"重试转存失败: {dir_path} - {error_msg}")
                                 if progress_callback:
-                                    progress_callback('error', f'转存失败: {dir_path} - {str(retry_e)}')
-                                return {'success': False, 'error': f'转存失败: {dir_path} - {str(retry_e)}'}
+                                    progress_callback('error', f'转存失败: {dir_path} - {error_msg}')
+                                return {'success': False, 'error': f'转存失败: {dir_path} - {error_msg}'}
                         else:
-                            logger.error(f"转存操作失败: {dir_path} - {str(e)}")
+                            error_msg = _format_transfer_error(str(e))
+                            logger.error(f"转存操作失败: {dir_path} - {error_msg}")
                             if progress_callback:
-                                progress_callback('error', f'转存失败: {dir_path} - {str(e)}')
-                            return {'success': False, 'error': f'转存失败: {dir_path} - {str(e)}'}
+                                progress_callback('error', f'转存失败: {dir_path} - {error_msg}')
+                            return {'success': False, 'error': f'转存失败: {dir_path} - {error_msg}'}
                     
                     time.sleep(1)  # 避免频率限制
                 
@@ -1195,20 +1334,20 @@ class BaiduStorage:
                 renamed_files = []
                 rename_errors = []
                 failed_transfer_rename = []  # 收集转存后重命名失败的文件
-
+                
                 for fs_id, dir_path, clean_path, final_path, need_rename in transfer_list:
                     if need_rename:
                         retry_count = 0
                         max_retries = 1
                         delay_seconds = self.config.get('file_operations', {}).get('rename_delay_seconds', 0.5)
-
+                        
                         while retry_count <= max_retries:
                             try:
                                 # 构建转存后的完整路径（原始文件名）
                                 original_full_path = posixpath.join(dir_path, os.path.basename(clean_path))
                                 # 构建重命名后的完整路径
                                 final_full_path = posixpath.join(dir_path, os.path.basename(final_path))
-
+                                
                                 if retry_count == 0:
                                     logger.info(f"重命名文件: {original_full_path} -> {final_full_path}")
                                     if progress_callback:
@@ -1217,20 +1356,20 @@ class BaiduStorage:
                                     logger.info(f"重试重命名文件: {original_full_path} -> {final_full_path} (第{retry_count}次重试)")
                                     if progress_callback:
                                         progress_callback('info', f'重试重命名文件: {os.path.basename(clean_path)} -> {os.path.basename(final_path)}')
-
+                                
                                 # 使用baidupcs-py的rename方法（需要完整路径）
-                                self.client.rename(original_full_path, final_full_path)
+                                temp_client.rename(original_full_path, final_full_path)
 
                                 logger.success(f"重命名成功: {clean_path} -> {final_path}")
                                 renamed_files.append(final_path)
-
+                                
                                 # 添加延迟避免API频率限制
                                 if delay_seconds > 0:
                                     logger.debug(f"延迟 {delay_seconds} 秒以避免API频率限制")
                                     time.sleep(delay_seconds)
-
+                                
                                 break  # 成功后跳出重试循环
-
+                                
                             except Exception as e:
                                 retry_count += 1
                                 if retry_count <= max_retries:
@@ -1250,35 +1389,35 @@ class BaiduStorage:
                                     renamed_files.append(clean_path)
                     else:
                         renamed_files.append(final_path)
-
+                
                 # 记录转存的文件列表（使用最终文件名）+ 仅重命名的文件
                 transferred_files = renamed_files + rename_only_success
-
+                
                 # 批量重试失败的重命名操作
                 all_failed_files = failed_rename_only + failed_transfer_rename
                 if all_failed_files:
                     logger.info(f"=== 【批量重试】开始批量重试 {len(all_failed_files)} 个重命名失败的文件 ===")
                     if progress_callback:
                         progress_callback('info', f'开始批量重试 {len(all_failed_files)} 个重命名失败的文件')
-
+                    
                     batch_retry_success = []
                     batch_retry_failed = []
                     delay_seconds = self.config.get('file_operations', {}).get('rename_delay_seconds', 0.5)
-
+                    
                     for dir_path, clean_path, final_path, original_error in all_failed_files:
                         try:
                             original_full_path = posixpath.join(dir_path, os.path.basename(clean_path))
                             final_full_path = posixpath.join(dir_path, os.path.basename(final_path))
-
+                            
                             logger.info(f"批量重试重命名: {original_full_path} -> {final_full_path}")
                             if progress_callback:
                                 progress_callback('info', f'批量重试: {os.path.basename(clean_path)} -> {os.path.basename(final_path)}')
 
-                            self.client.rename(original_full_path, final_full_path)
+                            temp_client.rename(original_full_path, final_full_path)
 
                             logger.success(f"批量重试成功: {clean_path} -> {final_path}")
                             batch_retry_success.append((clean_path, final_path))
-
+                            
                             # 更新相应的文件列表
                             if clean_path in renamed_files:
                                 # 如果原来是原文件名，现在改为最终文件名
@@ -1288,39 +1427,39 @@ class BaiduStorage:
                                 # 如果是rename_only的失败，添加到成功列表
                                 if (dir_path, clean_path, final_path, original_error) in failed_rename_only:
                                     rename_only_success.append(final_path)
-
+                            
                             # 添加延迟避免API频率限制
                             if delay_seconds > 0:
                                 logger.debug(f"批量重试延迟 {delay_seconds} 秒")
                                 time.sleep(delay_seconds)
-
+                                
                         except Exception as e:
                             logger.error(f"批量重试最终失败: {clean_path} -> {final_path}, 错误: {str(e)}")
                             batch_retry_failed.append((clean_path, final_path, str(e)))
                             rename_errors.append(f"批量重试最终失败: {clean_path} -> {final_path}, 错误: {str(e)}")
                             if progress_callback:
                                 progress_callback('error', f'批量重试失败: {str(e)}')
-
+                    
                     # 批量重试结果汇总
                     if batch_retry_success:
                         logger.success(f"批量重试成功 {len(batch_retry_success)} 个文件")
                         if progress_callback:
                             progress_callback('success', f'批量重试成功 {len(batch_retry_success)} 个文件')
-
+                    
                     if batch_retry_failed:
                         logger.error(f"批量重试仍失败 {len(batch_retry_failed)} 个文件")
                         if progress_callback:
                             progress_callback('error', f'批量重试仍失败 {len(batch_retry_failed)} 个文件')
-
+                    
                     # 更新transferred_files
                     transferred_files = renamed_files + rename_only_success
-
+                
                 # 记录重命名结果
                 if rename_errors:
                     logger.warning(f"部分文件重命名失败，共 {len(rename_errors)} 个错误")
                 elif any(need_rename for _, _, _, _, need_rename in transfer_list):
                     logger.success("所有需要重命名的文件都已成功重命名")
-
+                
                 # 转存结果汇总
                 logger.info(f"=== 转存操作完成，结果汇总 ===")
                 logger.info(f"总文件数: {total_files}")
@@ -1371,17 +1510,17 @@ class BaiduStorage:
         """获取分享链接的主文件夹名称"""
         try:
             logger.info(f"正在获取分享链接信息: {share_url}")
-
+            
             # 访问分享链接
             if pwd:
                 logger.info(f"使用密码访问分享链接")
-            self.client.access_shared(share_url, pwd)
+            self._access_shared_with_retry(share_url, pwd)
 
             # 获取分享文件列表
-            shared_paths = self.client.shared_paths(shared_url=share_url)
+            shared_paths = self._shared_paths_with_retry(shared_url=share_url)
             if not shared_paths:
                 return {'success': False, 'error': '获取分享文件列表失败'}
-
+            
             # 获取主文件夹名称
             if len(shared_paths) == 1 and shared_paths[0].is_dir:
                 # 如果只有一个文件夹，使用该文件夹名称
@@ -1401,7 +1540,7 @@ class BaiduStorage:
                     return {'success': True, 'folder_name': folder_name}
                 else:
                     return {'success': False, 'error': '分享内容为空'}
-
+                    
         except Exception as e:
             logger.error(f"获取分享信息失败: {str(e)}")
             return {'success': False, 'error': str(e)}
@@ -1414,6 +1553,41 @@ class BaiduStorage:
             time.sleep(wait_time)
         self.last_request_time = time.time()
 
+    @api_retry(max_retries=1, delay_range=(2, 3))
+    def _transfer_shared_paths_with_retry(self, remotedir, fs_ids, uk, share_id, bdstoken, shared_url, client=None):
+        """带重试功能的转存方法"""
+        if client is None:
+            client = self.client
+        return client.transfer_shared_paths(
+            remotedir=remotedir,
+            fs_ids=fs_ids,
+            uk=uk,
+            share_id=share_id,
+            bdstoken=bdstoken,
+            shared_url=shared_url
+        )
+
+    @api_retry(max_retries=1, delay_range=(2, 3))
+    def _access_shared_with_retry(self, share_url, pwd=None, client=None):
+        """带重试功能的访问分享链接方法"""
+        if client is None:
+            client = self.client
+        return client.access_shared(share_url, pwd)
+
+    @api_retry(max_retries=1, delay_range=(2, 3))
+    def _shared_paths_with_retry(self, shared_url, client=None):
+        """带重试功能的获取分享文件列表方法"""
+        if client is None:
+            client = self.client
+        return client.shared_paths(shared_url=shared_url)
+
+    @api_retry(max_retries=1, delay_range=(2, 3))
+    def _list_shared_paths_with_retry(self, path, uk, share_id, bdstoken, page=1, size=100, client=None):
+        """带重试功能的获取分享目录内容方法"""
+        if client is None:
+            client = self.client
+        return client.list_shared_paths(path, uk, share_id, bdstoken, page=page, size=size)
+
     def list_shared_files(self, share_url, pwd=None):
         """获取分享链接中的文件列表"""
         try:
@@ -1422,12 +1596,12 @@ class BaiduStorage:
                 logger.info(f"使用密码 {pwd} 访问分享链接")
                 
             logger.debug("开始访问分享链接...")
-            self.client.access_shared(share_url, pwd)
+            self._access_shared_with_retry(share_url, pwd)
             logger.debug("分享链接访问成功")
-            
+
             logger.debug("开始获取文件列表...")
             # 获取根目录文件列表
-            files = self.client.shared_paths(shared_url=share_url)
+            files = self._shared_paths_with_retry(shared_url=share_url)
             
             # 用于存储所有文件
             all_files = []
@@ -1439,7 +1613,7 @@ class BaiduStorage:
                         logger.debug(f"进入文件夹: {file.path}")
                         try:
                             # 递归获取子目录内容
-                            sub_files = self.client.list_shared_paths(
+                            sub_files = self._list_shared_paths_with_retry(
                                 file.path,
                                 file.uk,
                                 file.share_id,
@@ -1529,27 +1703,34 @@ class BaiduStorage:
             logger.error(f"检查存储状态失败: {str(e)}")
             return False
             
-    def list_local_files(self, dir_path):
-        """获取本地目录中的所有文件列表"""
+    def list_local_files(self, dir_path, client=None):
+        """获取本地目录中的所有文件列表
+        Args:
+            dir_path: 目录路径
+            client: 客户端实例，默认为None则使用self.client
+        """
         try:
+            if client is None:
+                client = self.client
+
             logger.debug(f"开始获取本地目录 {dir_path} 的文件列表")
             files = []
-            
+
             # 检查目录是否存在
             try:
                 # 尝试列出目录内容来检查是否存在
-                self.client.list(dir_path)
+                client.list(dir_path)
             except Exception as e:
                 if "No such file or directory" in str(e) or "-9" in str(e):
                     logger.info(f"本地目录 {dir_path} 不存在，将在转存时创建")
                     return []
                 else:
                     logger.error(f"检查目录 {dir_path} 时出错: {str(e)}")
-
+            
             def _list_dir(path):
                 try:
-                    content = self.client.list(path)
-                    
+                    content = client.list(path)
+
                     for item in content:
                         if item.is_file:
                             # 只保留文件名进行对比
@@ -1558,13 +1739,13 @@ class BaiduStorage:
                             logger.debug(f"记录本地文件: {file_name}")
                         elif item.is_dir:
                             _list_dir(item.path)
-                            
+
                 except Exception as e:
                     logger.error(f"列出目录 {path} 失败: {str(e)}")
                     raise
-                    
-            _list_dir(dir_path)
 
+            _list_dir(dir_path)
+            
             # 有序展示文件列表
             if files:
                 display_files = files[:20] if len(files) > 20 else files
@@ -1575,7 +1756,7 @@ class BaiduStorage:
                 logger.info(f"本地目录 {dir_path} 扫描完成，未找到任何文件")
 
             return files
-            
+
         except Exception as e:
             logger.error(f"获取本地文件列表失败: {str(e)}")
             return []
@@ -1606,33 +1787,38 @@ class BaiduStorage:
             logger.error(f"提取文件信息失败: {str(e)}")
             return None
 
-    def _list_shared_dir_files(self, path, uk, share_id, bdstoken):
+    def _list_shared_dir_files(self, path, uk, share_id, bdstoken, client=None):
         """递归获取共享目录下的所有文件
         Args:
             path: 目录路径
             uk: 用户uk
             share_id: 分享ID
             bdstoken: token
+            client: 客户端实例，默认为None则使用self.client
         Returns:
             list: 文件列表
         """
+        if client is None:
+            client = self.client
+
         files = []
         try:
             # 分页获取所有文件
             page = 1
             page_size = 100
             all_sub_files = []
-
+            
             while True:
-                sub_paths = self.client.list_shared_paths(
+                sub_paths = self._list_shared_paths_with_retry(
                     path.path,
                     uk,
                     share_id,
                     bdstoken,
                     page=page,
-                    size=page_size
+                    size=page_size,
+                    client=client
                 )
-
+                
                 if isinstance(sub_paths, list):
                     sub_files = sub_paths
                 elif isinstance(sub_paths, dict):
@@ -1640,21 +1826,21 @@ class BaiduStorage:
                 else:
                     logger.error(f"子目录内容格式错误: {type(sub_paths)}")
                     break
-
+                
                 if not sub_files:
                     # 没有更多文件了
                     break
-
+                
                 all_sub_files.extend(sub_files)
-
+                
                 # 如果当前页文件数少于页大小，说明已经是最后一页
                 if len(sub_files) < page_size:
                     break
-
+                
                 page += 1
-
+            
             logger.info(f"目录 {path.path} 共获取到 {len(all_sub_files)} 个文件/子目录")
-
+            
             sub_files = all_sub_files
 
             pattern = re.compile(r'关注|加入|新浪|防走丢|资源说明|资源汇总|资源大汇总|学习考证|公众号|汇总|电视剧合集|持续更新|禁商用|美剧整合', re.IGNORECASE)
@@ -1674,7 +1860,7 @@ class BaiduStorage:
                 # 如果是目录，递归获取
                 if sub_file.is_dir:
                     logger.info(f"递归处理子目录: {sub_file.path}")
-                    sub_dir_files = self._list_shared_dir_files(sub_file, uk, share_id, bdstoken)
+                    sub_dir_files = self._list_shared_dir_files(sub_file, uk, share_id, bdstoken, client=client)
                     files.extend(sub_dir_files)
                 else:
                     # 如果是文件，添加到列表
@@ -1735,7 +1921,7 @@ class BaiduStorage:
                 self._init_client()
                 # 清除用户信息缓存
                 self._clear_user_info_cache()
-
+            
             logger.success(f"更新用户成功: {username}")
             return True
             
@@ -1960,6 +2146,8 @@ class BaiduStorage:
                     tasks.pop(i)
                     # 确保更新调度器
                     self._save_config(update_scheduler=True)
+                    # 重新整理剩余任务的顺序
+                    self._update_task_orders()
                     logger.success(f"删除任务成功: order={order}")
                     return True
             logger.warning(f"未找到任务: order={order}")
@@ -2042,7 +2230,7 @@ class BaiduStorage:
                     # 如果过滤表达式为空，删除相关字段
                     tasks[task_index].pop('regex_pattern', None)
                     tasks[task_index].pop('regex_replace', None)
-
+            
             # 保存配置并更新调度器
             self._save_config()
             
@@ -2064,19 +2252,19 @@ class BaiduStorage:
         try:
             if not remote_dir.startswith('/'):
                 remote_dir = '/' + remote_dir
-
+                
             # 检查目录是否存在
             cmd = f'BaiduPCS-Py ls "{remote_dir}"'
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-
+            
             # 如果目录不存在，则创建
             if result.returncode != 0 and "No such file or directory" in result.stderr:
                 cmd = f'BaiduPCS-Py mkdir "{remote_dir}"'
                 result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-
+                
                 if result.returncode != 0:
                     raise Exception(f"创建目录失败: {result.stderr}")
-
+                    
             return True
         except Exception as e:
             logger.error(f"确保目录存在失败: {str(e)}")
@@ -2084,23 +2272,23 @@ class BaiduStorage:
 
     def share_file(self, remote_path, password=None, period_days=None):
         """分享远程文件或目录
-
+        
         Args:
             remote_path: 要分享的远程路径
             password: 分享密码，4个字符，可选
             period_days: 有效期，单位为天，可选
-
+            
         Returns:
             dict: 包含分享结果的字典
         """
         try:
             if not remote_path.startswith('/'):
                 remote_path = '/' + remote_path
-
+                
             # 验证密码长度
             if password and len(password) != 4:
                 return {'success': False, 'error': '密码必须是4个字符'}
-
+            
             # 先检查目录是否存在，如果不存在则创建
             try:
                 logger.info(f"检查目录是否存在: {remote_path}")
@@ -2113,17 +2301,17 @@ class BaiduStorage:
                     logger.error(error_msg)
                     return {'success': False, 'error': error_msg}
                 logger.success(f"成功创建目录: {remote_path}")
-
+            
             # 调用API分享文件
             # BaiduPCSApi.share方法要求password参数，如果为None则传空字符串
             # period参数为0表示永久有效
             logger.info(f"开始分享文件: {remote_path}")
             link = self.client.share(
-                remote_path,
-                password=password or "",
+                remote_path, 
+                password=password or "", 
                 period=period_days or 0
             )
-
+            
             # 构建返回结果
             share_info = {
                 'url': link.url,
@@ -2132,20 +2320,20 @@ class BaiduStorage:
                 'period_days': period_days,
                 'remote_path': remote_path
             }
-
+            
             logger.success(f"分享文件成功: {remote_path} -> {link.url}")
             return {
                 'success': True,
                 'share_info': share_info
             }
-
+                
         except Exception as e:
             logger.error(f"分享文件失败: {str(e)}")
             return {'success': False, 'error': str(e)}
 
     def update_task_share_info(self, task_order, share_info):
         """更新任务的分享信息
-
+        
         Args:
             task_order: 任务的order
             share_info: 分享信息字典
