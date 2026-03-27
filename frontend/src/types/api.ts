@@ -10,11 +10,12 @@ export interface ApiResponse<T = any> {
 // 任务相关类型
 export interface Task {
   order: number
+  task_uid?: string
   name?: string
   url: string
   save_dir: string
   pwd?: string
-  status: 'normal' | 'error' | 'running' | 'success'
+  status: 'normal' | 'error' | 'running' | 'success' | 'failed' | 'completed' | 'skipped'
   message?: string
   progress?: number
   category?: string
@@ -89,9 +90,9 @@ export interface CreateUserRequest {
 }
 
 export interface UpdateUserRequest {
+  original_username: string
   username: string
-  cookies?: string
-  new_username?: string
+  cookies: string
 }
 
 // 配置相关类型

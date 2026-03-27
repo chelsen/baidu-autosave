@@ -536,19 +536,24 @@ class TaskScheduler:
             return False
             
         try:
-            # 获取最新的任务信息
+            # 获取最新的任务信息，优先使用稳定标识避免 order 变化后串任务
             tasks = self.storage.config['baidu']['tasks']
-            task_order = task.get('order')
-            if not task_order:
-                logger.error(f"任务缺少order: {task.get('name', task.get('url', '未知任务'))}")
-                return False
-                
-            current_task = next((t for t in tasks if t.get('order') == task_order), None)
-            
+            task_uid = task.get('task_uid') if isinstance(task, dict) else None
+            task_order = task.get('order') if isinstance(task, dict) else None
+
+            current_task = self.storage.get_task_by_uid(task_uid)
+            if current_task is None and task_order:
+                current_task = next((t for t in tasks if t.get('order') == task_order), None)
+
             if not current_task:
-                logger.error(f"未找到任务: order={task_order}")
+                lookup = f"task_uid={task_uid}" if task_uid else f"order={task_order}"
+                logger.error(f"未找到任务: {lookup}")
                 return False
-            
+
+            task_order = current_task.get('order')
+            if not task_order:
+                logger.error(f"任务缺少order: {current_task.get('name', current_task.get('url', '未知任务'))}")
+                return False
             task_id = task_order - 1  # 转换为前端使用的task_id
             task_name = current_task.get('name', f'任务{task_order}')
             logger.info(f"开始执行任务: {task_name}")
@@ -714,30 +719,40 @@ class TaskScheduler:
                 }
                 self._notification_timer = None
 
-    def update_task_schedule(self, task_url, cron_exp=None):
+    def _resolve_task_reference(self, task_ref):
+        """按 task_uid/order/url 解析任务，兼容旧调用。"""
+        current_task = self.storage.resolve_task(task_ref)
+        if current_task is not None:
+            return current_task
+
+        if isinstance(task_ref, dict):
+            return None
+
+        return self.storage.resolve_task(url=task_ref)
+
+    def update_task_schedule(self, task_ref, cron_exp=None):
         """更新任务调度"""
         try:
-            tasks = self.storage.config['baidu']['tasks']
-            current_task = next((task for task in tasks if task['url'] == task_url), None)
-            
+            current_task = self._resolve_task_reference(task_ref)
+
             if not current_task:
-                logger.error(f"未找到任务: {task_url}")
+                logger.error(f"未找到任务: {task_ref}")
                 return False
-                
+
             task_order = current_task.get('order')
             if not task_order:
-                logger.error(f"任务缺少order: {task_url}")
+                logger.error(f"任务缺少order: {current_task.get('task_uid') or current_task.get('url')}")
                 return False
-            
+
             task_id = f'task_{task_order - 1}'  # 转换为前端使用的task_id
-            
+
             # 移除旧任务
             if self.scheduler.get_job(task_id):
                 self.scheduler.remove_job(task_id)
-            
+
             # 使用新的cron表达式或保持原值
             final_cron = cron_exp if cron_exp is not None else current_task.get('cron')
-            
+
             if final_cron:
                 try:
                     self.scheduler.add_job(
@@ -747,39 +762,42 @@ class TaskScheduler:
                         id=task_id,
                         replace_existing=True
                     )
-                    logger.info(f"已更新任务调度: {task_url} (task_id={task_order}) -> {final_cron}")
+                    logger.info(
+                        f"已更新任务调度: {current_task.get('task_uid', current_task.get('url'))} "
+                        f"(task_id={task_order}) -> {final_cron}"
+                    )
                 except Exception as e:
                     logger.error(f"更新任务调度失败: {str(e)}")
                     return False
             else:
-                logger.info(f"任务 {task_url} 切换到默认定时，正在更新调度...")
+                logger.info(
+                    f"任务 {current_task.get('task_uid', current_task.get('url'))} 切换到默认定时，正在更新调度..."
+                )
                 self.update_tasks()  # 重新加载所有任务的调度
-            
+
             return True
-            
+
         except Exception as e:
             logger.error(f"更新任务调度失败: {str(e)}")
             return False
 
-    def sync_task_info(self, task_url):
+    def sync_task_info(self, task_ref):
         """同步任务信息
         Args:
-            task_url: 任务的URL
+            task_ref: 任务引用（优先 task_uid，兼容 URL/order/任务对象）
         Returns:
             bool: 是否成功
         """
         try:
-            # 获取最新的任务信息
-            tasks = self.storage.config['baidu']['tasks']
-            current_task = next((task for task in tasks if task['url'] == task_url), None)
-            
+            current_task = self._resolve_task_reference(task_ref)
+
             if not current_task:
-                logger.error(f"未找到任务: {task_url}")
+                logger.error(f"未找到任务: {task_ref}")
                 return False
-            
+
             # 更新任务调度
-            return self.update_task_schedule(task_url, current_task.get('cron'))
-            
+            return self.update_task_schedule(current_task, current_task.get('cron'))
+
         except Exception as e:
             logger.error(f"同步任务信息失败: {str(e)}")
             return False

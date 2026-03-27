@@ -5,6 +5,42 @@ import AutoImport from 'unplugin-auto-import/vite'
 import Components from 'unplugin-vue-components/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 
+const backendTarget = process.env.VITE_BACKEND_TARGET || 'http://localhost:5000'
+const forwardedProto = (() => {
+  try {
+    return new URL(backendTarget).protocol.replace(':', '') || 'http'
+  } catch {
+    return 'http'
+  }
+})()
+
+const createProxyConfig = (withBypass = false) => ({
+  target: backendTarget,
+  changeOrigin: false,
+  secure: false,
+  xfwd: true,
+  cookieDomainRewrite: false,
+  cookiePathRewrite: false,
+  configure: (proxy) => {
+    proxy.on('proxyReq', (proxyReq, req) => {
+      // 使用当前访问地址透传 Host，兼容本机 IP 调试。
+      const host = req.headers.host || 'localhost:3001'
+      proxyReq.setHeader('X-Forwarded-Host', host)
+      proxyReq.setHeader('X-Forwarded-Proto', forwardedProto)
+    })
+  },
+  ...(withBypass
+    ? {
+        bypass: (req) => {
+          // 只代理表单提交，页面路由继续交给前端处理。
+          if (req.method !== 'POST') {
+            return '/index.html'
+          }
+        },
+      }
+    : {}),
+})
+
 export default defineConfig({
   base: './',
   plugins: [
@@ -29,66 +65,11 @@ export default defineConfig({
     open: false,
     proxy: {
       '/api': {
-        target: 'http://localhost:5000',
-        changeOrigin: false, // 保持原始host
-        secure: false,
+        ...createProxyConfig(),
         ws: true,
-        xfwd: true,
-        cookieDomainRewrite: false, // 禁用cookie域重写
-        cookiePathRewrite: false,   // 禁用cookie路径重写
-        configure: (proxy, options) => {
-          proxy.on('proxyReq', (proxyReq, req, res) => {
-            // 动态设置转发的Host头，支持本地IP访问
-            const host = req.headers.host || 'localhost:3001'
-            proxyReq.setHeader('X-Forwarded-Host', host)
-            proxyReq.setHeader('X-Forwarded-Proto', 'http')
-          })
-        }
       },
-      '/login': {
-        target: 'http://localhost:5000',
-        changeOrigin: false,
-        secure: false,
-        xfwd: true,
-        cookieDomainRewrite: false,
-        cookiePathRewrite: false,
-        configure: (proxy, options) => {
-          proxy.on('proxyReq', (proxyReq, req, res) => {
-            // 动态设置转发的Host头，支持本地IP访问
-            const host = req.headers.host || 'localhost:3001'
-            proxyReq.setHeader('X-Forwarded-Host', host)
-            proxyReq.setHeader('X-Forwarded-Proto', 'http')
-          })
-        },
-        bypass: (req, res, options) => {
-          // 只代理POST请求，GET请求让Vue Router处理
-          if (req.method !== 'POST') {
-            return '/index.html'
-          }
-        }
-      },
-      '/logout': {
-        target: 'http://localhost:5000',
-        changeOrigin: false,
-        secure: false,
-        xfwd: true,
-        cookieDomainRewrite: false,
-        cookiePathRewrite: false,
-        configure: (proxy, options) => {
-          proxy.on('proxyReq', (proxyReq, req, res) => {
-            // 动态设置转发的Host头，支持本地IP访问
-            const host = req.headers.host || 'localhost:3001'
-            proxyReq.setHeader('X-Forwarded-Host', host)
-            proxyReq.setHeader('X-Forwarded-Proto', 'http')
-          })
-        },
-        bypass: (req, res, options) => {
-          // 只代理POST请求
-          if (req.method !== 'POST') {
-            return '/index.html'
-          }
-        }
-      },
+      '/login': createProxyConfig(true),
+      '/logout': createProxyConfig(true),
     },
   },
   build: {

@@ -72,7 +72,8 @@
                   <div class="field-value">
                     <el-input
                       v-model="field.value"
-                      :type="field.name.includes('TOKEN') || field.name.includes('PASSWORD') ? 'password' : 
+                      :class="{ 'secret-field-input': isSecretField(field.name) }"
+                      :type="isSecretField(field.name) ? 'text' :
                              (field.name.includes('BODY') || field.name.includes('HEADERS')) ? 'textarea' : 'text'"
                       :rows="field.name.includes('BODY') ? 4 : 2"
                       :placeholder="getFieldPlaceholder(field.name)"
@@ -139,7 +140,7 @@
                   <div class="cron-schedule-container">
                     <div class="cron-schedule-list">
                       <div 
-                        v-for="(schedule, index) in cronForm.default_schedule" 
+                        v-for="(_, index) in cronForm.default_schedule"
                         :key="index"
                         class="cron-schedule-item"
                       >
@@ -230,7 +231,7 @@
         </el-tab-pane>
 
         <!-- 账户设置 -->
-        <el-tab-pane label="账户设置" name="account">
+        <el-tab-pane label="账户设置" name="account" lazy>
           <el-card>
             <div class="setting-section">
               <h3>账户信息</h3>
@@ -250,46 +251,71 @@
 
             <div class="setting-section">
               <h3>修改密码</h3>
-              <el-form :model="accountForm" label-width="120px">
-                <el-form-item label="当前密码">
-                  <el-input
-                    v-model="accountForm.currentPassword"
-                    type="password"
-                    placeholder="请输入当前密码"
-                    style="width: 300px;"
-                    show-password
-                  />
-                </el-form-item>
-                
-                <el-form-item label="新密码">
-                  <el-input
-                    v-model="accountForm.newPassword"
-                    type="password"
-                    placeholder="请输入新密码（至少6位）"
-                    style="width: 300px;"
-                    show-password
-                  />
-                </el-form-item>
-                
-                <el-form-item label="确认新密码">
-                  <el-input
-                    v-model="accountForm.confirmPassword"
-                    type="password"
-                    placeholder="请再次输入新密码"
-                    style="width: 300px;"
-                    show-password
-                  />
-                </el-form-item>
-                
-                <el-form-item>
-                  <el-button type="primary" @click="saveAccountSettings" :loading="accountSaving">
-                    修改密码
-                  </el-button>
-                  <el-button @click="accountForm.currentPassword = ''; accountForm.newPassword = ''; accountForm.confirmPassword = ''">
-                    重置
-                  </el-button>
-                </el-form-item>
-              </el-form>
+              <form class="account-password-form" @submit.prevent="saveAccountSettings" @reset.prevent="resetAccountForm">
+                <input
+                  class="account-password-username"
+                  :value="username || authForm.users"
+                  type="text"
+                  name="username"
+                  autocomplete="username"
+                  readonly
+                  tabindex="-1"
+                  aria-hidden="true"
+                />
+
+                <div class="account-password-fields">
+                  <div class="account-password-row">
+                    <label class="account-password-label" for="account-current-password">当前密码</label>
+                    <input
+                      id="account-current-password"
+                      v-model="accountForm.currentPassword"
+                      name="current-password"
+                      type="password"
+                      autocomplete="current-password"
+                      placeholder="请输入当前密码"
+                      class="account-password-native-input"
+                    />
+                  </div>
+
+                  <div class="account-password-row">
+                    <label class="account-password-label" for="account-new-password">新密码</label>
+                    <input
+                      id="account-new-password"
+                      v-model="accountForm.newPassword"
+                      name="new-password"
+                      type="password"
+                      autocomplete="new-password"
+                      placeholder="请输入新密码（至少6位）"
+                      class="account-password-native-input"
+                    />
+                  </div>
+
+                  <div class="account-password-row">
+                    <label class="account-password-label" for="account-confirm-password">确认新密码</label>
+                    <input
+                      id="account-confirm-password"
+                      v-model="accountForm.confirmPassword"
+                      name="confirm-password"
+                      type="password"
+                      autocomplete="new-password"
+                      placeholder="请再次输入新密码"
+                      class="account-password-native-input"
+                    />
+                  </div>
+
+                  <div class="account-password-actions">
+                    <span class="account-password-label"></span>
+                    <div class="account-password-action-buttons">
+                      <el-button type="primary" native-type="submit" :loading="accountSaving">
+                        修改密码
+                      </el-button>
+                      <el-button native-type="reset">
+                        重置
+                      </el-button>
+                    </div>
+                  </div>
+                </div>
+              </form>
             </div>
           </el-card>
         </el-tab-pane>
@@ -458,18 +484,15 @@
                   />
                   <div class="form-tip">系统管理员的登录用户名</div>
                 </el-form-item>
-                
-                <el-form-item label="管理员密码">
-                  <el-input
-                    v-model="authForm.password"
-                    type="password"
-                    placeholder="管理员密码"
-                    style="width: 200px;"
-                    show-password
-                  />
-                  <div class="form-tip">系统管理员的登录密码</div>
-                </el-form-item>
-                
+
+                <el-alert
+                  type="info"
+                  :closable="false"
+                  show-icon
+                  title="管理员密码请在“账户设置”页单独修改，系统设置页不再展示或回填密码。"
+                  style="margin-bottom: 18px; max-width: 620px;"
+                />
+
                 <el-form-item label="会话超时时间">
                   <el-input-number
                     v-model="authForm.session_timeout"
@@ -608,7 +631,6 @@ const quotaAlertForm = reactive({
 // 认证配置 (对应config.json中的auth)
 const authForm = reactive({
   users: 'koko',
-  password: 'kokojy1996',
   session_timeout: 3600
 })
 
@@ -720,6 +742,10 @@ const updateFieldValue = (name: string, value: string) => {
   }
 }
 
+const isSecretField = (name: string): boolean => {
+  return name.includes('TOKEN') || name.includes('PASSWORD')
+}
+
 // 获取字段占位符
 const getFieldPlaceholder = (name: string): string => {
   const placeholders: Record<string, string> = {
@@ -777,6 +803,12 @@ const saveSystemSettings = async () => {
   }
 }
 
+const resetAccountForm = () => {
+  accountForm.currentPassword = ''
+  accountForm.newPassword = ''
+  accountForm.confirmPassword = ''
+}
+
 // 保存账户设置
 const saveAccountSettings = async () => {
   // 验证表单
@@ -801,10 +833,7 @@ const saveAccountSettings = async () => {
   try {
     await authStore.updatePassword(accountForm.currentPassword, accountForm.newPassword)
     ElMessage.success('密码修改成功')
-    // 清空表单
-    accountForm.currentPassword = ''
-    accountForm.newPassword = ''
-    accountForm.confirmPassword = ''
+    resetAccountForm()
   } catch (error) {
     ElMessage.error(`密码修改失败：${error}`)
   } finally {
@@ -833,64 +862,63 @@ const removeCronSchedule = (index: number) => {
 // 初始化表单数据
 const initForms = () => {
   if (!config.value) return
-  
+
   // 通知设置 (从config.notify加载)
   if (config.value.notify) {
-    notificationForm.enabled = config.value.notify.enabled || false
-    notificationForm.notification_delay = config.value.notify.notification_delay || 30
-    
+    notificationForm.enabled = config.value.notify.enabled ?? false
+    notificationForm.notification_delay = config.value.notify.notification_delay ?? 30
+
     // 从direct_fields加载所有字段到allNotificationFields
-    const fields = config.value.notify.direct_fields || {}
+    const fields = config.value.notify.direct_fields ?? {}
     allNotificationFields.value = Object.entries(fields).map(([name, value]) => ({
       name,
-      value: String(value || '')
+      value: String(value ?? '')
     }))
   }
-  
+
   // 定时设置 (从config.cron加载) - 默认启用
   if (config.value.cron) {
-    cronForm.default_schedule = [...(config.value.cron.default_schedule || ['57 20,23 * * *', '53 12 * * *'])]
+    cronForm.default_schedule = [...(config.value.cron.default_schedule ?? ['57 20,23 * * *', '53 12 * * *'])]
   }
-  
+
   // 分享设置 (从config.share加载) - 默认启用
   if (config.value.share) {
-    shareForm.default_password = config.value.share.default_password || '8888'
-    shareForm.default_period_days = config.value.share.default_period_days || 7
+    shareForm.default_password = config.value.share.default_password ?? '8888'
+    shareForm.default_period_days = config.value.share.default_period_days ?? 7
   }
-  
+
   // 重试设置 (从config.retry加载)
   if (config.value.retry) {
-    retryForm.max_attempts = config.value.retry.max_attempts || 3
-    retryForm.delay_seconds = config.value.retry.delay_seconds || 5
+    retryForm.max_attempts = config.value.retry.max_attempts ?? 3
+    retryForm.delay_seconds = config.value.retry.delay_seconds ?? 5
   }
-  
+
   // 调度器设置 (从config.scheduler加载)
   if (config.value.scheduler) {
-    schedulerForm.max_workers = config.value.scheduler.max_workers || 1
-    schedulerForm.misfire_grace_time = config.value.scheduler.misfire_grace_time || 3600
+    schedulerForm.max_workers = config.value.scheduler.max_workers ?? 1
+    schedulerForm.misfire_grace_time = config.value.scheduler.misfire_grace_time ?? 3600
     schedulerForm.coalesce = config.value.scheduler.coalesce !== false
-    schedulerForm.max_instances = config.value.scheduler.max_instances || 1
+    schedulerForm.max_instances = config.value.scheduler.max_instances ?? 1
   }
-  
+
   // 文件操作设置 (从config.file_operations加载)
   if (config.value.file_operations) {
-    fileOpsForm.rename_delay_seconds = config.value.file_operations.rename_delay_seconds || 0.5
-    fileOpsForm.batch_size = config.value.file_operations.batch_size || 50
-    fileOpsForm.concurrent_limit = config.value.file_operations.concurrent_limit || 1
+    fileOpsForm.rename_delay_seconds = config.value.file_operations.rename_delay_seconds ?? 0.5
+    fileOpsForm.batch_size = config.value.file_operations.batch_size ?? 50
+    fileOpsForm.concurrent_limit = config.value.file_operations.concurrent_limit ?? 1
   }
-  
+
   // 配额告警设置 (从config.quota_alert加载)
   if (config.value.quota_alert) {
-    quotaAlertForm.enabled = config.value.quota_alert.enabled || false
-    quotaAlertForm.threshold_percent = config.value.quota_alert.threshold_percent || 98
-    quotaAlertForm.check_schedule = config.value.quota_alert.check_schedule || '0 0 * * *'
+    quotaAlertForm.enabled = config.value.quota_alert.enabled ?? false
+    quotaAlertForm.threshold_percent = config.value.quota_alert.threshold_percent ?? 98
+    quotaAlertForm.check_schedule = config.value.quota_alert.check_schedule ?? '0 0 * * *'
   }
-  
+
   // 认证设置 (从config.auth加载)
   if (config.value.auth) {
-    authForm.users = config.value.auth.users || ''
-    authForm.password = config.value.auth.password || ''
-    authForm.session_timeout = config.value.auth.session_timeout || 3600
+    authForm.users = config.value.auth.users ?? ''
+    authForm.session_timeout = config.value.auth.session_timeout ?? 3600
   }
 }
 
@@ -982,6 +1010,15 @@ onMounted(async () => {
   flex: 1;
 }
 
+.field-value :deep(.secret-field-input .el-input__wrapper) {
+  font-family: 'Courier New', monospace;
+}
+
+.field-value :deep(.secret-field-input .el-input__inner) {
+  -webkit-text-security: disc;
+  font-family: 'Courier New', monospace;
+}
+
 .field-description {
   font-size: 12px;
   color: #909399;
@@ -1032,6 +1069,73 @@ onMounted(async () => {
   color: #909399;
   margin-top: 4px;
   line-height: 1.4;
+}
+
+.account-password-form {
+  max-width: 460px;
+}
+
+.account-password-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.account-password-row,
+.account-password-actions {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.account-password-label {
+  color: #606266;
+  font-size: 14px;
+  line-height: 1.4;
+  text-align: right;
+}
+
+.account-password-native-input {
+  width: 100%;
+  max-width: 300px;
+  min-height: 40px;
+  padding: 0 12px;
+  font-size: 14px;
+  line-height: 40px;
+  color: #303133;
+  background: #fff;
+  border: 1px solid #dcdfe6;
+  border-radius: 4px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.account-password-native-input:focus {
+  outline: none;
+  border-color: #409eff;
+  box-shadow: 0 0 0 2px rgba(64, 158, 255, 0.12);
+}
+
+.account-password-native-input::placeholder {
+  color: #a8abb2;
+}
+
+.account-password-action-buttons {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.account-password-username {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .cron-schedule-container {

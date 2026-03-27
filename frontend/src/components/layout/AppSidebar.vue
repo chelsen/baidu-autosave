@@ -145,7 +145,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useTaskStore, useUserStore, useVersionStore } from '@/stores'
@@ -208,11 +208,6 @@ const handleMenuSelect = (index: string) => {
 const showAddTaskDialog = () => {
   emit('add-task')
 }
-
-// 监听路由变化，确保菜单高亮正确
-watch(() => route.path, (newPath) => {
-  // 如果需要特殊处理子路由，可以在这里添加逻辑
-})
 
 // 初始化
 onMounted(() => {

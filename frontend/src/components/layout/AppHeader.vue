@@ -109,14 +109,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useAuthStore, useUserStore, useVersionStore } from '@/stores'
 import { usePolling } from '@/composables/usePolling'
-import { getMenuRoutes } from '@/router'
 import { APP_VERSION } from '@/config/version'
-import { formatTime, isMobile as checkIsMobile } from '@/utils/helpers'
+import { formatTime } from '@/utils/helpers'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 // Props & Emits - 移动端菜单相关的emit已移除
@@ -136,7 +135,6 @@ const handleVersionCheck = () => {
 }
 
 // 响应式状态
-const isMobile = ref(checkIsMobile())
 const showNotifications = ref(false)
 const unreadCount = ref(0)
 const notifications = ref<any[]>([])
@@ -189,21 +187,8 @@ const getNotificationIcon = (type: string) => {
   return icons[type as keyof typeof icons] || 'Bell'
 }
 
-// 响应式监听
-const handleResize = () => {
-  isMobile.value = checkIsMobile()
-}
-
-onMounted(() => {
-  window.addEventListener('resize', handleResize)
-  
-  // 初始化通知数据（模拟）
-  // 实际项目中应该从API获取
-  
-  return () => {
-    window.removeEventListener('resize', handleResize)
-  }
-})
+// 初始化通知数据（模拟）
+// 实际项目中应该从API获取
 </script>
 
 <style scoped>

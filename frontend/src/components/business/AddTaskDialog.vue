@@ -121,7 +121,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, reactive, computed, nextTick, onMounted } from 'vue'
+import { ref, watch, reactive, computed, nextTick } from 'vue'
 import { ElMessage, type FormInstance } from 'element-plus'
 import { storeToRefs } from 'pinia'
 import { useTaskStore } from '@/stores/tasks'
@@ -402,7 +402,7 @@ const handleCancel = () => {
 // 监听任务数据变化
 watch(
   () => props.task,
-  (newTask, oldTask) => {
+  (newTask) => {
     // 使用nextTick确保DOM更新完成后再操作
     nextTick(() => {
       if (newTask) {

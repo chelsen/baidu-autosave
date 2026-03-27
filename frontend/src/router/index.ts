@@ -1,7 +1,7 @@
 // 路由配置
 import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
-import { ROUTES, PAGE_TITLES } from '@/utils/constants'
+import { PAGE_TITLES } from '@/utils/constants'
 
 // 路由懒加载
 const LoginView = () => import('@/views/login/LoginView.vue')
@@ -77,7 +77,7 @@ const router = createRouter({
 })
 
 // 路由守卫
-router.beforeEach(async (to, from, next) => {
+router.beforeEach(async (to, _from, next) => {
   const authStore = useAuthStore()
   
   // 设置页面标题
@@ -113,7 +113,7 @@ router.beforeEach(async (to, from, next) => {
 })
 
 // 路由后置守卫
-router.afterEach((to, from) => {
+router.afterEach((to) => {
   // 可以在这里添加页面访问统计等逻辑
   console.log(`导航到: ${to.path}`)
 })

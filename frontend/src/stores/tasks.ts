@@ -203,8 +203,12 @@ export const useTaskStore = defineStore('tasks', () => {
       if (!response.success) {
         throw new Error(response.message || '执行任务失败')
       }
-      
-      return true
+
+      if (task && response.task_uid) {
+        task.task_uid = response.task_uid
+      }
+
+      return response
     } catch (err) {
       // 恢复任务状态
       const task = tasks.value.find(t => t.order === taskId)
@@ -335,24 +339,6 @@ export const useTaskStore = defineStore('tasks', () => {
     }
   }
 
-  // 状态更新方法
-  const updateTaskStatus = (taskId: number, status: string, message?: string) => {
-    const task = tasks.value.find(t => t.order === taskId)
-    if (task) {
-      task.status = status as Task['status']
-      if (message !== undefined) {
-        task.message = message
-      }
-    }
-  }
-
-  const updateTaskProgress = (taskId: number, progress: number) => {
-    const task = tasks.value.find(t => t.order === taskId)
-    if (task) {
-      task.progress = progress
-    }
-  }
-
   const clearError = () => {
     error.value = null
   }
@@ -393,10 +379,7 @@ export const useTaskStore = defineStore('tasks', () => {
     selectAllTasks,
     clearSelection,
     toggleTaskSelection,
-    
-    // 状态更新
-    updateTaskStatus,
-    updateTaskProgress,
+
     clearError
   }
 })

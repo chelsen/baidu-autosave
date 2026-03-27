@@ -13,6 +13,7 @@ import subprocess
 import shutil
 import json
 import random
+import uuid
 from functools import wraps
 
 def _format_transfer_error(error_str):
@@ -72,6 +73,8 @@ class BaiduStorage:
     def __init__(self):
         self._client_lock = Lock()  # 添加客户端初始化锁
         self.config = self._load_config()
+        if self._ensure_task_uids():
+            self._save_config(update_scheduler=False)
         self.client = None
         self._init_client()
         self.last_request_time = 0
@@ -90,7 +93,7 @@ class BaiduStorage:
             if not os.path.exists('config/config.json') or os.path.getsize('config/config.json') == 0:
                 logger.warning("配置文件不存在或为空，将从模板创建")
                 self._create_config_from_template()
-
+            
             with open('config/config.json', 'r', encoding='utf-8') as f:
                 config = json.load(f)
                 # 确保配置文件结构完整
@@ -104,7 +107,7 @@ class BaiduStorage:
                     config['baidu']['tasks'] = []
                 if 'cron' not in config:
                     config['cron'] = {
-                        'default_schedule': '0 8,18,20 * * *',
+                        'default_schedule': '*/5 * * * *',
                         'auto_install': True
                     }
                 # 添加 auth 配置结构
@@ -123,7 +126,7 @@ class BaiduStorage:
                     'tasks': []
                 },
                 'cron': {
-                    'default_schedule': '0 8,18,20 * * *',
+                    'default_schedule': '*/5 * * * *',
                     'auto_install': True
                 },
                 'auth': {
@@ -135,7 +138,7 @@ class BaiduStorage:
         except Exception as e:
             logger.error(f"加载配置文件失败: {str(e)}")
             raise
-
+    
     def _create_config_from_template(self):
         """从模板创建配置文件"""
         try:
@@ -144,32 +147,32 @@ class BaiduStorage:
                 'config/config.template.json',
                 'template/config.template.json'
             ]
-
+            
             template_path = None
             for path in template_paths:
                 if os.path.exists(path):
                     template_path = path
                     break
-
+            
             if not template_path:
                 logger.error("找不到配置模板文件")
                 raise FileNotFoundError("配置模板文件不存在")
-
+            
             # 备份现有配置文件（如果存在）
             if os.path.exists('config/config.json'):
                 backup_path = f'config/config.json.backup.{int(time.time())}'
                 shutil.copy2('config/config.json', backup_path)
                 logger.info(f"已备份现有配置文件到: {backup_path}")
-
+            
             # 从模板复制配置文件
             os.makedirs('config', exist_ok=True)
             shutil.copy2(template_path, 'config/config.json')
             logger.info(f"已从模板 {template_path} 创建配置文件")
-
+            
         except Exception as e:
             logger.error(f"从模板创建配置文件失败: {str(e)}")
             raise
-
+            
     def _save_config(self, update_scheduler=True):
         """保存配置到文件"""
         try:
@@ -534,6 +537,73 @@ class BaiduStorage:
             logger.error(f"获取最大顺序值失败: {str(e)}")
             return 0
 
+    def _ensure_task_uids(self, tasks=None):
+        """为任务补齐稳定标识，避免依赖可变的 order。"""
+        changed = False
+        if tasks is None:
+            tasks = self.config['baidu'].get('tasks', [])
+
+        for task in tasks:
+            if not task.get('task_uid'):
+                task['task_uid'] = uuid.uuid4().hex
+                changed = True
+
+        return changed
+
+    def get_task_by_uid(self, task_uid):
+        """通过稳定标识查找任务。"""
+        if not task_uid:
+            return None
+
+        tasks = self.config['baidu'].get('tasks', [])
+        for task in tasks:
+            if task.get('task_uid') == task_uid:
+                return task
+
+        return None
+
+    def get_task_by_order(self, order):
+        """通过 order 查找任务。"""
+        if order is None:
+            return None
+
+        tasks = self.config['baidu'].get('tasks', [])
+        for task in tasks:
+            if task.get('order') == order:
+                return task
+
+        return None
+
+    def resolve_task(self, task_ref=None, task_uid=None, order=None, url=None):
+        """按 task_uid/order/url 解析任务，优先使用稳定标识。"""
+        if isinstance(task_ref, dict):
+            task_uid = task_uid or task_ref.get('task_uid')
+            order = order if order is not None else task_ref.get('order')
+            url = url or task_ref.get('url')
+        elif isinstance(task_ref, str):
+            if len(task_ref) == 32 and all(ch in '0123456789abcdef' for ch in task_ref.lower()):
+                task_uid = task_uid or task_ref
+            else:
+                url = url or task_ref
+        elif isinstance(task_ref, int):
+            order = order if order is not None else task_ref
+
+        task = self.get_task_by_uid(task_uid)
+        if task is not None:
+            return task
+
+        task = self.get_task_by_order(order)
+        if task is not None:
+            return task
+
+        if url:
+            tasks = self.config['baidu'].get('tasks', [])
+            for item in tasks:
+                if item.get('url') == url:
+                    return item
+
+        return None
+
     def _update_task_orders(self):
         """重新整理所有任务的顺序"""
         try:
@@ -615,14 +685,14 @@ class BaiduStorage:
                 import urllib.parse
                 parsed = urllib.parse.urlparse(url)
                 params = urllib.parse.parse_qs(parsed.query)
-
+                
                 # 提取surl参数
                 surl = params.get('surl', [''])[0]
-
+                
                 # 转换为第一种格式
                 if surl:
                     url = f"https://pan.baidu.com/s/{surl}"
-
+            
             # 验证URL格式（更新正则表达式以适应可能的查询参数）
             if not re.match(r'^https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+(?:\?pwd=[a-zA-Z0-9]+)?$', url):
                 raise ValueError("无效的百度网盘分享链接格式")
@@ -638,7 +708,8 @@ class BaiduStorage:
                 'name': name or url,
                 'status': 'pending',
                 'transferred_files': [],
-                'order': new_order
+                'order': new_order,
+                'task_uid': uuid.uuid4().hex
             }
             
             # 添加可选字段
@@ -705,20 +776,165 @@ class BaiduStorage:
             str: 标准化后的路径
         """
         try:
-            # 统一使用正斜杠，去除多余斜杠
-            path = path.replace('\\', '/').strip('/')
-            
+            path = str(path or '').replace('\\', '/').strip()
+            path = re.sub(r'/+', '/', path)
+            clean_path = path.strip('/')
+
             if file_only:
-                # 只返回文件名
-                return path.split('/')[-1]
-            
-            # 确保目录以 / 开头
-            if not path.startswith('/'):
-                path = '/' + path
-            return path
+                return clean_path.split('/')[-1] if clean_path else ''
+
+            return '/' + clean_path if clean_path else '/'
         except Exception as e:
             logger.error(f"标准化路径失败: {str(e)}")
             return path
+
+    def _is_missing_path_error(self, error):
+        """判断错误是否表示路径不存在。"""
+        error_text = str(error).lower()
+        return (
+            'no such file or directory' in error_text
+            or 'error_code: -9' in error_text
+            or 'error_code: 31066' in error_text
+        )
+
+    def _is_already_exists_error(self, error):
+        """判断错误是否表示目录已存在。"""
+        error_text = str(error)
+        lowered = error_text.lower()
+        return (
+            'file already exists' in lowered
+            or 'error_code: 31061' in lowered
+            or '文件已经存在' in error_text
+        )
+
+    def _is_uncertain_path_error(self, error):
+        """判断错误是否属于目录状态不明确的临时异常。"""
+        lowered = str(error).lower()
+        return 'error_code: 31023' in lowered
+
+    def _confirm_dir_exists(self, path, client=None, check_error=None):
+        """通过重试和父目录枚举兜底确认目录是否已存在。"""
+        try:
+            if client is None:
+                client = self.client
+
+            if self._dir_exists_via_parent_listing(path, client=client):
+                logger.debug(f"目录已存在（父目录枚举确认）: {path}")
+                return True
+
+            if check_error is not None and self._is_uncertain_path_error(check_error):
+                logger.debug(f"目录检查返回 31023，重试确认目录状态: {path}, 错误: {str(check_error)}")
+                time.sleep(0.2)
+                try:
+                    self._list_dir_entries_with_fallback(path, client=client)
+                    logger.debug(f"目录已存在（重试确认）: {path}")
+                    return True
+                except Exception as retry_error:
+                    if self._dir_exists_via_parent_listing(path, client=client):
+                        logger.debug(f"目录已存在（重试后父目录枚举确认）: {path}")
+                        return True
+                    logger.debug(f"目录重试确认仍未命中: {path}, 错误: {str(retry_error)}")
+        except Exception as confirm_error:
+            logger.debug(f"确认目录存在失败: {path}, 错误: {str(confirm_error)}")
+
+        return False
+
+    def _get_list_entry_path(self, item):
+        """提取目录枚举结果中的路径。"""
+        if isinstance(item, dict):
+            return str(item.get('path', '') or '')
+        return str(getattr(item, 'path', '') or '')
+
+    def _is_list_entry_dir(self, item):
+        """判断目录枚举结果是否为目录。"""
+        if isinstance(item, dict):
+            return bool(item.get('isdir', 0) == 1 or item.get('is_dir', False))
+        return bool(getattr(item, 'is_dir', False) or getattr(item, 'isdir', 0) == 1)
+
+    def _is_list_entry_file(self, item):
+        """判断目录枚举结果是否为文件。"""
+        if isinstance(item, dict):
+            return bool(item.get('isdir', 0) == 0 and not item.get('is_dir', False))
+        return bool(getattr(item, 'is_file', False) or not self._is_list_entry_dir(item))
+
+    def _list_dir_entries_via_pan_api(self, path, client=None):
+        """使用 pan API 枚举目录内容，规避 PCS list 对部分路径返回 31023 的问题。"""
+        if client is None:
+            client = self.client
+
+        path = self._normalize_path(path)
+        raw_client = getattr(client, '_baidupcs', None)
+        if raw_client is None:
+            raise RuntimeError('当前客户端不支持 pan API 目录枚举')
+
+        url = 'https://pan.baidu.com/api/list'
+        page = 1
+        page_size = 100
+        entries = []
+
+        while True:
+            response = raw_client._request_get(url, params={
+                'dir': path,
+                'page': page,
+                'num': page_size,
+                'order': 'name',
+            })
+            data = response.json()
+            errno = data.get('errno', 0)
+            if errno not in (0, None):
+                error_msg = data.get('errmsg') or data.get('error_msg') or data.get('message') or '未知错误'
+                raise RuntimeError(f"error_code: {errno}, message: {error_msg}")
+
+            batch = data.get('list', []) or []
+            entries.extend(batch)
+            if len(batch) < page_size:
+                break
+            page += 1
+
+        logger.debug(f"通过 pan API 获取目录内容成功: {path}, 共 {len(entries)} 项")
+        return entries
+
+    def _list_dir_entries_with_fallback(self, path, client=None):
+        """优先使用 pan API 枚举目录内容，失败时回退到 PCS list。"""
+        if client is None:
+            client = self.client
+
+        path = self._normalize_path(path)
+        try:
+            return self._list_dir_entries_via_pan_api(path, client=client)
+        except Exception as pan_error:
+            if self._is_missing_path_error(pan_error):
+                raise
+
+            logger.warning(f"pan API 列目录失败，尝试使用 PCS list 回退: {path}, 错误: {str(pan_error)}")
+            try:
+                return client.list(path)
+            except Exception as pcs_error:
+                logger.debug(f"PCS list 回退列目录失败: {path}, 错误: {str(pcs_error)}")
+                raise pan_error
+
+    def _dir_exists_via_parent_listing(self, path, client=None):
+        """当直接列目录失败时，回退到父目录枚举确认目录是否存在。"""
+        try:
+            if client is None:
+                client = self.client
+
+            path = self._normalize_path(path)
+            if path == '/':
+                return True
+
+            parent_dir = self._normalize_path(posixpath.dirname(path) or '/')
+            target_name = self._normalize_path(path, file_only=True)
+
+            for item in self._list_dir_entries_with_fallback(parent_dir, client=client):
+                item_path = self._get_list_entry_path(item)
+                item_name = self._normalize_path(item_path, file_only=True)
+                if item_name == target_name and self._is_list_entry_dir(item):
+                    return True
+        except Exception as e:
+            logger.debug(f"通过父目录枚举确认目录失败: {path}, 错误: {str(e)}")
+
+        return False
 
     def _ensure_dir_exists(self, path, client=None):
         """确保目录存在，如果不存在则创建
@@ -733,45 +949,58 @@ class BaiduStorage:
                 client = self.client
 
             path = self._normalize_path(path)
+            if path == '/':
+                return True
 
-            # 检查目录是否存在
             try:
-                client.list(path)
+                self._list_dir_entries_with_fallback(path, client=client)
                 logger.debug(f"目录已存在: {path}")
                 return True
-            except Exception as e:
-                if 'error_code: 31066' in str(e):  # 目录不存在
-                    logger.info(f"目录不存在，开始创建: {path}")
-                    try:
-                        client.makedir(path)
-                        logger.success(f"创建目录成功: {path}")
-                        return True
-                    except Exception as create_e:
-                        if 'error_code: 31062' in str(create_e):  # 文件名非法
-                            logger.error(f"目录名非法: {path}")
-                        elif 'file already exists' in str(create_e).lower():
-                            # 并发创建时可能发生
-                            logger.debug(f"目录已存在（可能是并发创建）: {path}")
-                            return True
-                        elif 'no such file or directory' in str(create_e).lower():
-                            # 需要创建父目录
-                            parent_dir = os.path.dirname(path)
-                            if parent_dir and parent_dir != '/':
-                                logger.info(f"需要先创建父目录: {parent_dir}")
-                                if self._ensure_dir_exists(parent_dir, client=client):
-                                    # 父目录创建成功，重试创建当前目录
-                                    return self._ensure_dir_exists(path, client=client)
-                                else:
-                                    logger.error(f"创建父目录失败: {parent_dir}")
-                                    return False
-                            logger.error(f"无法创建目录，父目录不存在: {path}")
-                            return False
-                        else:
-                            logger.error(f"创建目录失败: {path}, 错误: {str(create_e)}")
-                            return False
+            except Exception as check_error:
+                if self._confirm_dir_exists(path, client=client, check_error=check_error):
+                    return True
+                if self._is_missing_path_error(check_error):
+                    logger.debug(f"目录不存在，准备尝试创建: {path}, 错误: {str(check_error)}")
                 else:
-                    logger.error(f"检查目录失败: {path}, 错误: {str(e)}")
+                    logger.debug(f"目录检查未通过，准备尝试创建: {path}, 错误: {str(check_error)}")
+
+            try:
+                client.makedir(path)
+                logger.success(f"创建目录成功: {path}")
+                return True
+            except Exception as create_error:
+                error_text = str(create_error)
+                if 'error_code: 31062' in error_text:
+                    logger.error(f"目录名非法: {path}")
                     return False
+                if self._is_already_exists_error(create_error):
+                    logger.debug(f"目录已存在（创建接口确认）: {path}")
+                    return True
+                if self._confirm_dir_exists(path, client=client, check_error=create_error):
+                    logger.debug(f"目录已存在（创建异常后确认）: {path}")
+                    return True
+
+                parent_dir = posixpath.dirname(path)
+                if parent_dir and parent_dir not in ('', path, '/'):
+                    logger.info(f"尝试先创建父目录: {parent_dir}")
+                    if self._ensure_dir_tree_exists(parent_dir, client=client):
+                        try:
+                            client.makedir(path)
+                            logger.success(f"创建目录成功: {path}")
+                            return True
+                        except Exception as retry_error:
+                            retry_text = str(retry_error)
+                            if self._is_already_exists_error(retry_error):
+                                logger.debug(f"目录已存在（重试创建时检测到）: {path}")
+                                return True
+                            if self._confirm_dir_exists(path, client=client, check_error=retry_error):
+                                logger.debug(f"目录已存在（重试创建异常后确认）: {path}")
+                                return True
+                            logger.error(f"创建目录失败: {path}, 错误: {retry_text}")
+                            return False
+
+                logger.error(f"创建目录失败: {path}, 错误: {error_text}")
+                return False
 
         except Exception as e:
             logger.error(f"确保目录存在时发生错误: {path}, 错误: {str(e)}")
@@ -793,11 +1022,12 @@ class BaiduStorage:
 
             # 如果目录已存在，直接返回成功
             try:
-                client.list(path)
+                self._list_dir_entries_with_fallback(path, client=client)
                 logger.debug(f"目录已存在: {path}")
                 return True
-            except:
-                pass
+            except Exception as check_error:
+                if self._confirm_dir_exists(path, client=client, check_error=check_error):
+                    return True
 
             # 分解路径
             parts = path.strip('/').split('/')
@@ -1054,7 +1284,7 @@ class BaiduStorage:
                             'size': path.size,
                             'isdir': 0
                         })
-
+                
                 logger.info(f"共记录 {len(shared_files_info)} 个共享文件")
                 if progress_callback:
                     progress_callback('info', f'获取到 {len(shared_files_info)} 个共享文件')
@@ -1235,7 +1465,7 @@ class BaiduStorage:
                 for _, dir_path, _, _, _ in transfer_list:
                     if dir_path not in created_dirs:
                         logger.info(f"检查目录: {dir_path}")
-                        if not self._ensure_dir_exists(dir_path, client=temp_client):
+                        if not self._ensure_dir_tree_exists(dir_path, client=temp_client):
                             logger.error(f"创建目录失败: {dir_path}")
                             if progress_callback:
                                 progress_callback('error', f'创建目录失败: {dir_path}')
@@ -1713,39 +1943,58 @@ class BaiduStorage:
             if client is None:
                 client = self.client
 
+            dir_path = self._normalize_path(dir_path)
             logger.debug(f"开始获取本地目录 {dir_path} 的文件列表")
             files = []
 
-            # 检查目录是否存在
+            def _list_dir_with_fallback(path, allow_missing=False):
+                """优先使用 PCS list，失败时回退到 pan API。"""
+                try:
+                    return self._list_dir_entries_with_fallback(path, client=client)
+                except Exception as list_error:
+                    if self._is_missing_path_error(list_error):
+                        if allow_missing:
+                            return None
+                        raise
+
+                    if allow_missing and not self._confirm_dir_exists(path, client=client, check_error=list_error):
+                        return None
+
+                    raise
+
+            # 检查目录是否存在，并在可确认存在时继续执行后续扫描
             try:
-                # 尝试列出目录内容来检查是否存在
-                client.list(dir_path)
-            except Exception as e:
-                if "No such file or directory" in str(e) or "-9" in str(e):
+                root_content = _list_dir_with_fallback(dir_path, allow_missing=True)
+                if root_content is None:
                     logger.info(f"本地目录 {dir_path} 不存在，将在转存时创建")
                     return []
-                else:
-                    logger.error(f"检查目录 {dir_path} 时出错: {str(e)}")
-            
-            def _list_dir(path):
+            except Exception as e:
+                logger.error(f"检查目录 {dir_path} 时出错: {str(e)}")
+                return []
+
+            def _list_dir(path, prefetched_content=None):
                 try:
-                    content = client.list(path)
+                    content = prefetched_content if prefetched_content is not None else _list_dir_with_fallback(path)
 
                     for item in content:
-                        if item.is_file:
+                        item_path = self._get_list_entry_path(item)
+                        if not item_path:
+                            continue
+
+                        if self._is_list_entry_file(item):
                             # 只保留文件名进行对比
-                            file_name = os.path.basename(item.path)
+                            file_name = os.path.basename(item_path)
                             files.append(file_name)
                             logger.debug(f"记录本地文件: {file_name}")
-                        elif item.is_dir:
-                            _list_dir(item.path)
+                        elif self._is_list_entry_dir(item):
+                            _list_dir(item_path)
 
                 except Exception as e:
                     logger.error(f"列出目录 {path} 失败: {str(e)}")
                     raise
 
-            _list_dir(dir_path)
-            
+            _list_dir(dir_path, prefetched_content=root_content)
+
             # 有序展示文件列表
             if files:
                 display_files = files[:20] if len(files) > 20 else files
@@ -1807,7 +2056,7 @@ class BaiduStorage:
             page = 1
             page_size = 100
             all_sub_files = []
-            
+
             while True:
                 sub_paths = self._list_shared_paths_with_retry(
                     path.path,
@@ -1842,16 +2091,8 @@ class BaiduStorage:
             logger.info(f"目录 {path.path} 共获取到 {len(all_sub_files)} 个文件/子目录")
             
             sub_files = all_sub_files
-
-            pattern = re.compile(r'关注|加入|新浪|防走丢|资源说明|资源汇总|资源大汇总|学习考证|公众号|汇总|电视剧合集|持续更新|禁商用|美剧整合', re.IGNORECASE)
-            # 不以 mp4|mkv|mp3 结尾的推广文件忽略
-            # pattern = re.compile(r'^(?!.*\.(?:mp4|mkv|mp3)$)(?=.*(?:资源|公众号|汇总|电视剧合集|持续更新|霸王龙|禁商用|美剧整合)).*$', re.IGNORECASE)
-
+                
             for sub_file in sub_files:
-                if pattern.search(sub_file.path):
-                    logger.warning(f"忽略推广文件: {sub_file.path}")
-                    continue
-
                 if hasattr(sub_file, '_asdict'):
                     sub_file_dict = sub_file._asdict()
                 else:
@@ -2010,8 +2251,8 @@ class BaiduStorage:
             # 更新调度器
             from scheduler import TaskScheduler
             if hasattr(TaskScheduler, 'instance') and TaskScheduler.instance:
-                TaskScheduler.instance.update_task_schedule(url, tasks[index].get('cron'))
-                logger.info(f"已更新任务调度: {url}")
+                TaskScheduler.instance.update_task_schedule(tasks[index], tasks[index].get('cron'))
+                logger.info(f"已更新任务调度: {tasks[index].get('task_uid', url)}")
             
             logger.success(f"更新任务成功: {tasks[index]}")
             return True, True  # 第二个True表示调度器已更新
@@ -2237,8 +2478,8 @@ class BaiduStorage:
             # 更新调度器
             from scheduler import TaskScheduler
             if hasattr(TaskScheduler, 'instance') and TaskScheduler.instance:
-                TaskScheduler.instance.update_task_schedule(url, tasks[task_index].get('cron'))
-                logger.info(f"已更新任务调度: {url}")
+                TaskScheduler.instance.update_task_schedule(tasks[task_index], tasks[task_index].get('cron'))
+                logger.info(f"已更新任务调度: {tasks[task_index].get('task_uid', url)}")
             
             logger.success(f"更新任务成功: {tasks[task_index]}")
             return True
@@ -2292,15 +2533,18 @@ class BaiduStorage:
             # 先检查目录是否存在，如果不存在则创建
             try:
                 logger.info(f"检查目录是否存在: {remote_path}")
-                self.client.list(remote_path)
+                self._list_dir_entries_with_fallback(remote_path, client=self.client)
                 logger.info(f"目录已存在: {remote_path}")
             except Exception as e:
-                logger.info(f"目录不存在，尝试创建: {remote_path}")
-                if not self._ensure_dir_tree_exists(remote_path):
-                    error_msg = f"无法创建目录: {remote_path}"
-                    logger.error(error_msg)
-                    return {'success': False, 'error': error_msg}
-                logger.success(f"成功创建目录: {remote_path}")
+                if self._confirm_dir_exists(remote_path, client=self.client, check_error=e):
+                    logger.info(f"目录已存在（异常后确认）: {remote_path}")
+                else:
+                    logger.info(f"目录不存在，尝试创建: {remote_path}")
+                    if not self._ensure_dir_tree_exists(remote_path):
+                        error_msg = f"无法创建目录: {remote_path}"
+                        logger.error(error_msg)
+                        return {'success': False, 'error': error_msg}
+                    logger.success(f"成功创建目录: {remote_path}")
             
             # 调用API分享文件
             # BaiduPCSApi.share方法要求password参数，如果为None则传空字符串

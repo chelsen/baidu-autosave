@@ -110,10 +110,6 @@ export class ApiService {
     return httpClient.get('/api/version/check', { source })
   }
 
-  async getLogs(limit?: number): Promise<ApiResponse<any>> {
-    return httpClient.get('/api/logs', { limit })
-  }
-
   async getTasksStatus(): Promise<ApiResponse<{ tasks: Task[] }>> {
     return httpClient.get('/api/tasks/status')
   }

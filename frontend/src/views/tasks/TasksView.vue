@@ -70,6 +70,10 @@
 
     <!-- 任务列表 -->
     <div class="task-list-container">
+      <div v-if="!canDragSort" class="sort-tip">
+        当前处于搜索、筛选或倒序状态，请切回正序并清空筛选后再拖拽排序。
+      </div>
+
       <!-- 桌面端表格 -->
       <el-table
         ref="tableRef"
@@ -86,7 +90,11 @@
         <!-- 拖拽手柄列 -->
         <el-table-column label="排序" class-name="col-drag" align="center">
           <template #default>
-            <div class="drag-handle" :class="{ 'dragging': isDragging }">
+            <div
+              class="drag-handle"
+              :class="{ 'dragging': isDragging, 'drag-disabled': !canDragSort }"
+              :title="canDragSort ? '拖拽调整顺序' : '请先切回正序并清空筛选后再拖拽排序'"
+            >
               <el-icon><DCaret /></el-icon>
             </div>
           </template>
@@ -377,7 +385,7 @@ import { useTasks } from '@/composables/useTasks'
 import AddTaskDialog from '@/components/business/AddTaskDialog.vue'
 import TaskRunnerDialog from '@/components/business/TaskRunnerDialog.vue'
 import type { Task } from '@/types'
-import { getTaskStatusText, getTaskStatusColor } from '@/utils/helpers'
+import { getTaskStatusText } from '@/utils/helpers'
 import Sortable from 'sortablejs'
 
 const taskStore = useTaskStore()
@@ -476,6 +484,10 @@ const filteredTasks = computed(() => {
   })
 
   return result
+})
+
+const canDragSort = computed(() => {
+  return !searchQuery.value && statusFilter.value === 'all' && categoryFilter.value === 'all' && !isReversed.value
 })
 
 // 方法
@@ -594,7 +606,7 @@ const handleDialogClose = (visible: boolean) => {
 }
 
 // 任务运行窗口相关处理
-const handleTaskCompleted = (task: Task) => {
+const handleTaskCompleted = () => {
   // 任务完成后更新任务列表
   taskStore.fetchTasks()
 }
@@ -613,15 +625,20 @@ const handleTaskRunnerClose = () => {
 // 拖拽功能
 const initSortable = async () => {
   await nextTick()
-  
-  const el = tableRef.value?.$el?.querySelector('.el-table__body-wrapper tbody')
-  if (!el) return
-  
-  // 销毁之前的实例
+
+  // 销毁之前的实例，避免状态切换后仍然可拖拽
   if (sortableInstance) {
     sortableInstance.destroy()
+    sortableInstance = null
   }
-  
+
+  if (!canDragSort.value) {
+    return
+  }
+
+  const el = tableRef.value?.$el?.querySelector('.el-table__body-wrapper tbody')
+  if (!el) return
+
   sortableInstance = Sortable.create(el, {
     animation: 300,
     ghostClass: 'sortable-ghost',
@@ -633,30 +650,37 @@ const initSortable = async () => {
     },
     onEnd: async (event) => {
       isDragging.value = false
-      
+
+      if (!canDragSort.value) {
+        ElMessage.warning('请切回正序并清空筛选后再拖拽排序')
+        await fetchTasks()
+        tableKey.value++
+        return
+      }
+
       const { oldIndex, newIndex } = event
       if (oldIndex === undefined || newIndex === undefined || oldIndex === newIndex) {
         return
       }
-      
+
       try {
         const movedTask = filteredTasks.value[oldIndex]
         if (movedTask) {
-          // 找到任务在完整任务列表中的索引
-          const taskIndex = tasks.value.findIndex(t => t.order === movedTask.order)
+          // 仅在完整正序列表中允许拖拽，order 可直接映射到后端 task_id
+          const taskIndex = movedTask.order - 1
           if (taskIndex !== -1) {
             // 调用API移动任务
             moveTask(taskIndex, newIndex).then(async () => {
               console.log('任务顺序已同步到后端')
-              
+
               // 重新获取最新数据
               await fetchTasks()
-              
+
               // 强制重新渲染整个表格（这会销毁并重新创建所有DOM）
               tableKey.value++
-              
+
               console.log('拖拽排序完成，表格已强制重新渲染')
-              
+
             }).catch(async (error) => {
               console.error('API调用失败:', error)
               // 失败时也重新获取数据恢复状态
@@ -765,6 +789,11 @@ watch(tasks, async () => {
     await initSortable()
   }
 }, { deep: true })
+
+watch([searchQuery, statusFilter, categoryFilter, isReversed], async () => {
+  await nextTick()
+  await initSortable()
+})
 </script>
 
 <style scoped>
@@ -816,6 +845,14 @@ watch(tasks, async () => {
   border-radius: 8px;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
   overflow: hidden;
+}
+
+.sort-tip {
+  padding: 12px 16px;
+  font-size: 13px;
+  color: #e6a23c;
+  background: #fdf6ec;
+  border-bottom: 1px solid #faecd8;
 }
 
 .desktop-table {
@@ -975,7 +1012,12 @@ watch(tasks, async () => {
   padding: 4px;
 }
 
-.drag-handle:hover {
+.drag-handle.drag-disabled {
+  cursor: not-allowed;
+  color: #dcdfe6;
+}
+
+.drag-handle:not(.drag-disabled):hover {
   color: #409eff;
 }
 

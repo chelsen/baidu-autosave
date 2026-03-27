@@ -1,6 +1,5 @@
 // 轮询服务
 import { apiService } from './api'
-import type { Task, LogEntry } from '@/types'
 
 // 浏览器兼容的 EventEmitter 实现
 class EventEmitter {
