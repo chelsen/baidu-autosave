@@ -2,7 +2,7 @@
   <div class="users-view">
     <div class="page-header">
       <h1 class="page-title">用户管理</h1>
-      <el-button type="primary" @click="showAddUserDialog = true">
+      <el-button type="primary" @click="openAddUserDialog">
         <el-icon><Plus /></el-icon>
         添加用户
       </el-button>
@@ -101,6 +101,7 @@
       v-model="showAddUserDialog"
       :title="editingUser ? '编辑用户' : '添加用户'"
       width="600px"
+      @closed="resetUserForm"
     >
       <el-form
         ref="userFormRef"
@@ -181,6 +182,11 @@ const switchUser = async (username: string) => {
   }
 }
 
+const openAddUserDialog = () => {
+  resetUserForm()
+  showAddUserDialog.value = true
+}
+
 const editUser = async (user: User) => {
   editingUser.value = user
   
@@ -259,7 +265,8 @@ const handleUserSubmit = async () => {
   try {
     if (editingUser.value) {
       await userStore.updateUser({
-        username: editingUser.value.username,
+        original_username: editingUser.value.username,
+        username: userForm.value.username,
         cookies: userForm.value.cookies
       })
       ElMessage.success('用户信息已更新')

@@ -1,5 +1,5 @@
 // 版本检查组合式函数
-import { ref, onMounted } from 'vue'
+import { ref } from 'vue'
 import { apiService } from '@/services'
 import { APP_VERSION } from '@/config/version'
 import { compareVersions } from '@/utils/helpers'

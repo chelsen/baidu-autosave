@@ -23,13 +23,13 @@ app.use(pinia)
 app.use(router)
 
 // 全局错误处理
-app.config.errorHandler = (err, vm, info) => {
+app.config.errorHandler = (err, _vm, info) => {
   console.error('Vue全局错误:', err, info)
   // 可以在这里添加错误上报逻辑
 }
 
 // 全局警告处理
-app.config.warnHandler = (msg, vm, trace) => {
+app.config.warnHandler = (msg, _vm, trace) => {
   console.warn('Vue警告:', msg, trace)
 }
 

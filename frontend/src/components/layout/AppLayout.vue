@@ -78,10 +78,8 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
-import { useRoute } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useAuthStore, useTaskStore, useUserStore } from '@/stores'
-import { usePolling } from '@/composables/usePolling'
 import { isMobile as checkIsMobile } from '@/utils/helpers'
 import { appStorage } from '@/utils/storage'
 import AppHeader from './AppHeader.vue'
@@ -89,11 +87,9 @@ import AppSidebar from './AppSidebar.vue'
 import AppBottomNav from './AppBottomNav.vue'
 
 // Composables
-const route = useRoute()
 const authStore = useAuthStore()
 const taskStore = useTaskStore()
 const userStore = useUserStore()
-const { isRunning: pollingRunning } = usePolling()
 
 // Store 数据
 const { loading: authLoading } = storeToRefs(authStore)
@@ -166,17 +162,6 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('resize', handleResize)
-})
-
-// 监听路由变化，在移动端关闭侧边栏
-const unwatchRoute = route && (() => {
-  return route ? null : null // TODO: 实现路由监听
-})
-
-onUnmounted(() => {
-  if (unwatchRoute) {
-    unwatchRoute()
-  }
 })
 </script>
 

@@ -142,6 +142,7 @@ import { Document } from '@element-plus/icons-vue'
 import type { Task } from '@/types'
 import { getTaskStatusText, formatFileSize } from '@/utils/helpers'
 import { apiService } from '@/services/api'
+import { createTaskStream, type TaskLogEntry } from '@/services/taskStream'
 
 interface Props {
   modelValue: boolean
@@ -158,46 +159,156 @@ interface Emits {
 const props = defineProps<Props>()
 const emit = defineEmits<Emits>()
 
-// 响应式状态
 const visible = computed({
   get: () => props.modelValue,
   set: (value: boolean) => emit('update:modelValue', value)
 })
 
-// 任务状态
 const currentStatus = ref(props.task?.status || 'normal')
 const currentMessage = ref(props.task?.message || '')
 const startTime = ref('')
 const elapsedTime = ref('00:00')
 const transferredFiles = ref<any[]>([])
 
-// 日志相关
-const logs = ref<any[]>([])
+const logs = ref<TaskLogEntry[]>([])
 const logsLoading = ref(false)
 const logsContainer = ref<HTMLElement>()
 
-// 控制状态
 const cancelling = ref(false)
-let statusTimer: NodeJS.Timeout | null = null
-let timeTimer: NodeJS.Timeout | null = null
-let stopDelayTimer: NodeJS.Timeout | null = null
+let pollTimer: ReturnType<typeof setTimeout> | null = null
+let timeTimer: ReturnType<typeof setInterval> | null = null
+let streamFallbackTimer: ReturnType<typeof setTimeout> | null = null
+let streamController: { close: () => void } | null = null
 let startTimestamp: Date | null = null
-let isStoppingScheduled = false // 防止重复设置停止延迟
-let logsRequestId = 0 // 防止日志轮询竞态，丢弃过期响应
-let terminalDetectedAt: number | null = null // 终止日志首次出现时间
-let lastTerminalLogCount = 0 // 终止日志出现时的日志条数
-let terminalStopProcessed = false // 是否已按终止日志完成收尾
+let pollSessionId = 0
+let streamSessionId = 0
+let logsRequestId = 0
+let terminalDetectedAt: number | null = null
+let lastTerminalLogCount = 0
+let completionHandled = false
+let streamConnected = false
+let streamErrorCount = 0
 
-// 计算属性
-const isRunning = computed(() => currentStatus.value === 'running')
+const POLL_INTERVAL_MS = 800
+const TERMINAL_SETTLE_MS = 1500
+const TERMINAL_MESSAGES = ['转存成功', '没有新文件需要转存']
+const STREAM_CONNECT_TIMEOUT_MS = 4000
+const STREAM_MAX_ERRORS = 2
 
-// 方法
+const isRunning = computed(() => {
+  return !isTerminalTask({
+    status: currentStatus.value,
+    message: currentMessage.value
+  } as Task)
+})
+
+const resetCompletionTracking = () => {
+  terminalDetectedAt = null
+  lastTerminalLogCount = 0
+  completionHandled = false
+}
+
+const clearStreamFallbackTimer = () => {
+  if (streamFallbackTimer) {
+    clearTimeout(streamFallbackTimer)
+    streamFallbackTimer = null
+  }
+}
+
+const closeTaskStream = () => {
+  clearStreamFallbackTimer()
+  if (streamController) {
+    streamController.close()
+    streamController = null
+  }
+  streamSessionId += 1
+  streamConnected = false
+  streamErrorCount = 0
+}
+
+const scrollLogsToBottom = async () => {
+  await nextTick()
+  if (logsContainer.value) {
+    logsContainer.value.scrollTop = logsContainer.value.scrollHeight
+  }
+}
+
+const setLogs = async (newLogs: TaskLogEntry[], forceScroll = false) => {
+  if (newLogs.length < logs.value.length) {
+    return logs.value
+  }
+
+  const logCountChanged = newLogs.length !== logs.value.length
+  logs.value = newLogs
+
+  if (logCountChanged || forceScroll) {
+    await scrollLogsToBottom()
+  }
+
+  return logs.value
+}
+
+const appendLog = async (logEntry: TaskLogEntry) => {
+  const lastLog = logs.value.at(-1)
+  if (
+    lastLog
+    && lastLog.timestamp === logEntry.timestamp
+    && lastLog.level === logEntry.level
+    && lastLog.message === logEntry.message
+  ) {
+    return logs.value
+  }
+
+  logs.value = [...logs.value, logEntry]
+  await scrollLogsToBottom()
+  return logs.value
+}
+
+const applyTaskState = (taskData: Partial<Task> | null | undefined) => {
+  if (!taskData) return
+
+  if (taskData.status) {
+    currentStatus.value = taskData.status
+  }
+  currentMessage.value = taskData.message || ''
+
+  if (taskData.transferred_files) {
+    transferredFiles.value = taskData.transferred_files
+  }
+}
+
+const isTerminalTask = (taskData: Task | null | undefined) => {
+  if (!taskData) return false
+
+  if (['success', 'error', 'failed', 'completed', 'skipped'].includes(taskData.status)) {
+    return true
+  }
+
+  return taskData.status === 'normal'
+    && TERMINAL_MESSAGES.some(message => taskData.message?.includes(message))
+}
+
+const scheduleNextPoll = (delay = POLL_INTERVAL_MS) => {
+  if (!visible.value) return
+
+  if (pollTimer) {
+    clearTimeout(pollTimer)
+  }
+
+  pollTimer = setTimeout(() => {
+    void pollTaskState()
+  }, delay)
+}
+
 const getStatusType = (status: string) => {
   const typeMap: Record<string, string> = {
     normal: 'info',
-    running: 'warning', 
+    running: 'warning',
     success: 'success',
-    error: 'danger'
+    completed: 'success',
+    skipped: 'success',
+    error: 'danger',
+    failed: 'danger'
   }
   return typeMap[status] || 'info'
 }
@@ -209,7 +320,10 @@ const getStatusText = (status: string) => {
 const getAlertType = (status: string) => {
   const typeMap: Record<string, 'success' | 'warning' | 'info' | 'error'> = {
     success: 'success',
+    completed: 'success',
+    skipped: 'success',
     error: 'error',
+    failed: 'error',
     running: 'warning',
     normal: 'info'
   }
@@ -218,12 +332,11 @@ const getAlertType = (status: string) => {
 
 const formatLogTime = (timestamp: string) => {
   if (!timestamp) return ''
-  
-  // 如果是HH:MM:SS格式，直接返回
+
   if (/^\d{2}:\d{2}:\d{2}$/.test(timestamp)) {
     return timestamp
   }
-  
+
   try {
     const date = new Date(timestamp)
     if (isNaN(date.getTime())) {
@@ -237,7 +350,7 @@ const formatLogTime = (timestamp: string) => {
 
 const updateElapsedTime = () => {
   if (!startTimestamp) return
-  
+
   const now = new Date()
   const diff = now.getTime() - startTimestamp.getTime()
   const minutes = Math.floor(diff / 60000)
@@ -245,206 +358,233 @@ const updateElapsedTime = () => {
   elapsedTime.value = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
 }
 
-const startMonitoring = () => {
-  if (!props.task) return
-  
-  // 重置停止监控状态
-  isStoppingScheduled = false
-  // 重置日志请求序号，丢弃之前可能未返回的旧请求
-  logsRequestId = 0
-  // 重置终止检测状态
-  terminalDetectedAt = null
-  lastTerminalLogCount = 0
-  terminalStopProcessed = false
-  if (stopDelayTimer) {
-    clearTimeout(stopDelayTimer)
-    stopDelayTimer = null
-  }
-  
-  // 设置开始时间
-  startTimestamp = new Date()
-  startTime.value = startTimestamp.toLocaleString()
-  currentStatus.value = 'running'
-  currentMessage.value = '任务正在执行中...'
-  
-  // 开始时间计时器
-  timeTimer = setInterval(updateElapsedTime, 1000)
-  
-  // 开始状态轮询 - 使用更频繁的轮询来捕获快速完成的任务
-  statusTimer = setInterval(async () => {
-    await checkTaskStatus()
-    // 监控期间总是刷新日志
-    await refreshLogs()
-  }, 200) // 每200毫秒检查一次状态，提高实时性
-  
-  // 立即检查一次状态和日志
-  checkTaskStatus()
-  refreshLogs()
-  
-  // 额外的日志轮询 - 确保日志更新及时
-  setTimeout(() => {
-    refreshLogs()
-  }, 100)
-  setTimeout(() => {
-    refreshLogs()
-  }, 300)
-}
+const refreshLogs = async ({ showLoading = false }: { showLoading?: boolean } = {}) => {
+  const sessionId = pollSessionId
+  const currentReqId = ++logsRequestId
 
-const checkTaskStatus = async () => {
-  if (!props.task) return
-  
-  try {
-    const response = await apiService.getTaskStatus(props.taskId)
-    
-    if (response.success) {
-      const taskData = response.status || response.data
-      const oldStatus = currentStatus.value
-      
-      currentStatus.value = taskData.status
-      currentMessage.value = taskData.message || ''
-      
-      // 如果任务完成，更新转存文件信息
-      if (taskData.transferred_files) {
-        transferredFiles.value = taskData.transferred_files
-      }
-      
-      // 检查任务是否已完成 (包括直接从pending跳到完成状态的情况)
-      const isTaskCompleted = ['success', 'normal', 'error', 'failed', 'completed'].includes(taskData.status)
-      const wasTaskCompleted = ['success', 'normal', 'error', 'failed', 'completed'].includes(oldStatus)
-      
-      // 如果任务状态从运行中或pending变为完成状态，延迟停止监控
-      if (!wasTaskCompleted && isTaskCompleted && !isStoppingScheduled) {
-        console.log(`任务状态从 ${oldStatus} 变为 ${taskData.status}，准备延迟停止监控`)
-        isStoppingScheduled = true
-        
-        // 任务完成时，延迟停止监控，确保后端日志完全写入
-        stopDelayTimer = setTimeout(async () => {
-          console.log('延迟时间到，最后刷新日志并停止监控')
-          await refreshLogs() // 最后一次刷新日志
-          stopMonitoring()    // 然后停止监控
-          emit('task-completed', taskData)
-          
-          // 根据执行结果显示消息
-          if (taskData.status === 'success' || (taskData.status === 'normal' && taskData.message?.includes('成功'))) {
-            ElMessage.success('任务执行完成')
-          } else if (taskData.status === 'error' || taskData.status === 'failed') {
-            ElMessage.error('任务执行失败')
-          } else if (taskData.status === 'normal') {
-            ElMessage.success('任务执行完成')
-          }
-          
-          isStoppingScheduled = false
-          stopDelayTimer = null
-        }, 6000) // 延迟6秒停止，给后端充足时间写入所有日志
-      }
-    }
-  } catch (error) {
-    console.error('检查任务状态失败:', error)
+  if (showLoading) {
+    logsLoading.value = true
   }
-}
 
-const refreshLogs = async () => {
-  logsLoading.value = true
-  
   try {
-    // 获取任务特定的日志
-    const currentReqId = ++logsRequestId
     const response = await apiService.getTaskLog(props.taskId)
-    
+
+    if (sessionId !== pollSessionId || currentReqId !== logsRequestId) {
+      return logs.value
+    }
+
     if (response.success) {
       const newLogs = response.logs || response.data?.logs || []
-      // 若在本次请求期间又发起了更新请求，则丢弃当前过期响应
-      if (currentReqId !== logsRequestId) {
-        return
-      }
-      // 防止旧响应覆盖新数据，保证日志条数只增不减
-      if (newLogs.length < logs.value.length) {
-        return
-      }
-      logs.value = newLogs
-      
-      // 滚动到底部
-      await nextTick()
-      if (logsContainer.value) {
-        logsContainer.value.scrollTop = logsContainer.value.scrollHeight
-      }
-
-      // 基于"终止日志"判断是否可以结束轮询
-      // 注意：只检测真正的最终日志，"没有新文件需要转存"会在执行过程中出现，不是最终日志
-      const TERMINAL_KEYWORDS = ['任务执行完成', '任务执行失败', '任务执行异常']
-      const hasTerminal = newLogs.some((l: any) => typeof l?.message === 'string' && TERMINAL_KEYWORDS.some(k => l.message.includes(k)))
-      const now = Date.now()
-      if (hasTerminal && !terminalStopProcessed) {
-        // 首次或新增日志后重置检测窗口
-        if (terminalDetectedAt === null || newLogs.length !== lastTerminalLogCount) {
-          terminalDetectedAt = now
-          lastTerminalLogCount = newLogs.length
-        } else if (now - terminalDetectedAt >= 3000) { // 终止日志稳定>=3s，确保所有日志写入
-          terminalStopProcessed = true
-          isStoppingScheduled = true
-          if (stopDelayTimer) {
-            clearTimeout(stopDelayTimer)
-            stopDelayTimer = null
-          }
-          // 最后获取一次最终状态，确保展示一致
-          try {
-            const st = await apiService.getTaskStatus(props.taskId)
-            if (st.success) {
-              const taskData = st.status || st.data
-              if (taskData) {
-                currentStatus.value = taskData.status
-                currentMessage.value = taskData.message || ''
-                if (taskData.transferred_files) {
-                  transferredFiles.value = taskData.transferred_files
-                }
-                emit('task-completed', taskData)
-              }
-            }
-          } catch {}
-          stopMonitoring()
-        }
-      } else if (!hasTerminal) {
-        // 未检测到终止日志，重置检测窗口
-        terminalDetectedAt = null
-      }
+      return await setLogs(newLogs, showLoading)
     }
   } catch (error) {
     console.error('获取日志失败:', error)
   } finally {
-    logsLoading.value = false
+    if (showLoading && currentReqId === logsRequestId) {
+      logsLoading.value = false
+    }
   }
+
+  return logs.value
+}
+
+const checkTaskStatus = async () => {
+  if (!props.task) return null
+
+  const sessionId = pollSessionId
+
+  try {
+    const response = await apiService.getTaskStatus(props.taskId)
+
+    if (sessionId !== pollSessionId) {
+      return null
+    }
+
+    if (response.success) {
+      const taskData = response.status || response.data
+      applyTaskState(taskData)
+      return taskData
+    }
+  } catch (error) {
+    console.error('检查任务状态失败:', error)
+  }
+
+  return null
+}
+
+const stopPolling = () => {
+  if (pollTimer) {
+    clearTimeout(pollTimer)
+    pollTimer = null
+  }
+
+  pollSessionId += 1
+  logsRequestId += 1
+  logsLoading.value = false
 }
 
 const stopMonitoring = () => {
-  if (statusTimer) {
-    clearInterval(statusTimer)
-    statusTimer = null
-  }
-  
+  stopPolling()
+  closeTaskStream()
+
   if (timeTimer) {
     clearInterval(timeTimer)
     timeTimer = null
   }
-  
-  if (stopDelayTimer) {
-    clearTimeout(stopDelayTimer)
-    stopDelayTimer = null
+}
+
+const finalizeTask = async (taskData: Task | null, options: { refreshLatestLogs?: boolean } = {}) => {
+  if (completionHandled || !taskData) {
+    return
   }
-  
-  isStoppingScheduled = false
-  // 使正在进行的日志请求失效，避免关闭后过期响应覆盖UI
-  logsRequestId++
+
+  completionHandled = true
+
+  if (options.refreshLatestLogs) {
+    await refreshLogs()
+  }
+
+  stopMonitoring()
+  emit('task-completed', taskData)
+
+  if (taskData.status === 'success' || taskData.status === 'completed' || taskData.status === 'skipped') {
+    ElMessage.success('任务执行完成')
+  } else if (taskData.status === 'error' || taskData.status === 'failed') {
+    ElMessage.error('任务执行失败')
+  } else {
+    ElMessage.success('任务执行完成')
+  }
+}
+
+const pollTaskState = async () => {
+  if (!visible.value || !props.task) {
+    return
+  }
+
+  const taskData = await checkTaskStatus()
+  const latestLogs = await refreshLogs()
+
+  if (!visible.value) {
+    return
+  }
+
+  if (isTerminalTask(taskData)) {
+    if (terminalDetectedAt === null || latestLogs.length !== lastTerminalLogCount) {
+      terminalDetectedAt = Date.now()
+      lastTerminalLogCount = latestLogs.length
+      scheduleNextPoll(300)
+      return
+    }
+
+    if (Date.now() - terminalDetectedAt >= TERMINAL_SETTLE_MS) {
+      await finalizeTask(taskData, { refreshLatestLogs: false })
+      return
+    }
+
+    scheduleNextPoll(300)
+    return
+  }
+
+  terminalDetectedAt = null
+  lastTerminalLogCount = latestLogs.length
+  scheduleNextPoll()
+}
+
+const startPollingMode = () => {
+  stopPolling()
+  void pollTaskState()
+}
+
+const fallbackToPolling = (sessionId: number) => {
+  if (!visible.value || sessionId !== streamSessionId) {
+    return
+  }
+
+  closeTaskStream()
+  startPollingMode()
+}
+
+const startTaskStream = (taskUid?: string) => {
+  if (!taskUid) {
+    return false
+  }
+
+  closeTaskStream()
+  const sessionId = ++streamSessionId
+  streamConnected = false
+  streamErrorCount = 0
+
+  clearStreamFallbackTimer()
+  streamFallbackTimer = setTimeout(() => {
+    if (!streamConnected) {
+      fallbackToPolling(sessionId)
+    }
+  }, STREAM_CONNECT_TIMEOUT_MS)
+
+  streamController = createTaskStream(taskUid, {
+    onConnected: () => {
+      if (sessionId !== streamSessionId) return
+      streamConnected = true
+      streamErrorCount = 0
+      clearStreamFallbackTimer()
+    },
+    onSnapshot: async (payload) => {
+      if (sessionId !== streamSessionId) return
+      applyTaskState(payload.task)
+      await setLogs(payload.logs || [], true)
+    },
+    onLog: async (payload) => {
+      if (sessionId !== streamSessionId) return
+      await appendLog(payload)
+    },
+    onStatus: (payload) => {
+      if (sessionId !== streamSessionId) return
+      applyTaskState(payload)
+    },
+    onCompleted: async ({ task }) => {
+      if (sessionId !== streamSessionId) return
+      applyTaskState(task)
+      await finalizeTask(task)
+    },
+    onError: (error) => {
+      if (sessionId !== streamSessionId || !visible.value) return
+      console.error('任务 SSE 连接异常:', error)
+      streamErrorCount += 1
+      if (!streamConnected || streamErrorCount >= STREAM_MAX_ERRORS) {
+        fallbackToPolling(sessionId)
+      }
+    }
+  })
+
+  return true
+}
+
+const startMonitoring = () => {
+  if (!props.task) return
+
+  stopMonitoring()
+  resetCompletionTracking()
+  logs.value = []
+  transferredFiles.value = []
+  elapsedTime.value = '00:00'
+  currentStatus.value = 'running'
+  currentMessage.value = '任务正在执行中...'
+
+  startTimestamp = new Date()
+  startTime.value = startTimestamp.toLocaleString()
+  timeTimer = setInterval(updateElapsedTime, 1000)
+
+  if (!startTaskStream(props.task.task_uid)) {
+    startPollingMode()
+  }
 }
 
 const handleCancel = async () => {
-  // 注意：当前后端没有取消任务的API，这里只是预留接口
   cancelling.value = true
   try {
     ElMessage.warning('任务取消功能暂未实现')
-    // TODO: 实现任务取消API
-    // await apiService.cancelTask(props.taskId)
     emit('task-cancelled')
-  } catch (error) {
+  } catch {
     ElMessage.error('取消任务失败')
   } finally {
     cancelling.value = false
@@ -452,25 +592,21 @@ const handleCancel = async () => {
 }
 
 const handleClose = async () => {
-  // 关闭前最后刷新一次日志
-  if (currentStatus.value === 'running') {
-    await refreshLogs()
+  if (isRunning.value) {
+    await refreshLogs({ showLoading: true })
   }
   stopMonitoring()
   visible.value = false
 }
 
-// 监听器
 watch(() => props.modelValue, (newVal) => {
   if (newVal && props.task) {
     startMonitoring()
-    refreshLogs()
   } else {
     stopMonitoring()
   }
 })
 
-// 生命周期
 onUnmounted(() => {
   stopMonitoring()
 })
@@ -484,6 +620,7 @@ onUnmounted(() => {
 .task-runner-content {
   max-height: 70vh;
   overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .section-title {
@@ -494,6 +631,8 @@ onUnmounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .task-info-section {
@@ -531,6 +670,7 @@ onUnmounted(() => {
 }
 
 .status-progress {
+  min-width: 0;
   padding: 16px;
   background: white;
   border: 1px solid #e4e7ed;
@@ -541,16 +681,22 @@ onUnmounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
+  min-width: 0;
   margin-bottom: 12px;
 }
 
 .current-message {
+  flex: 1;
+  min-width: 0;
   font-size: 14px;
   color: #303133;
   font-weight: 500;
+  overflow-wrap: anywhere;
 }
 
 .elapsed-time {
+  flex-shrink: 0;
   font-size: 12px;
   color: #909399;
   font-family: monospace;
@@ -613,12 +759,14 @@ onUnmounted(() => {
 .logs-container {
   height: 200px;
   overflow-y: auto;
+  overflow-x: hidden;
   border: 1px solid #e4e7ed;
   border-radius: 8px;
   background: #f8f9fa;
   font-family: 'Courier New', monospace;
   font-size: 12px;
   padding: 8px;
+  box-sizing: border-box;
 }
 
 .no-logs {
@@ -628,8 +776,11 @@ onUnmounted(() => {
 }
 
 .log-entry {
-  display: flex;
+  display: grid;
+  grid-template-columns: 60px 50px minmax(0, 1fr);
+  align-items: start;
   gap: 8px;
+  width: 100%;
   padding: 2px 0;
   border-bottom: 1px solid #f0f0f0;
 }
@@ -651,8 +802,10 @@ onUnmounted(() => {
 }
 
 .log-message {
-  flex: 1;
-  word-break: break-all;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .log-info .log-level {

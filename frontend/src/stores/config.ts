@@ -55,7 +55,6 @@ interface QuotaAlertConfig {
 
 interface AuthConfig {
   users?: string
-  password?: string
   session_timeout?: number
 }
 
@@ -343,7 +342,6 @@ export const useConfigStore = defineStore('config', () => {
       },
       auth: {
         users: '',
-        password: '',
         session_timeout: 3600
       }
     }

@@ -1,13 +1,17 @@
 <template>
   <div id="app">
-    <!-- 登录页面使用独立布局 -->
-    <template v-if="isLoginPage">
+    <template v-if="showProtectedLayout">
+      <AppLayout />
+    </template>
+
+    <template v-else-if="isPublicRoute">
       <router-view />
     </template>
-    
-    <!-- 其他页面使用主布局 -->
+
     <template v-else>
-      <AppLayout />
+      <div class="route-guard-loading" aria-label="页面跳转中">
+        <div class="route-guard-spinner"></div>
+      </div>
     </template>
   </div>
 </template>
@@ -22,18 +26,19 @@ const route = useRoute()
 const authStore = useAuthStore()
 const versionStore = useVersionStore()
 
-// 检查是否是登录页面
-const isLoginPage = computed(() => {
-  return route.path === '/login'
+const isPublicRoute = computed(() => route.meta.requiresAuth === false || route.path === '/login')
+
+const showProtectedLayout = computed(() => {
+  return Boolean(route.meta.requiresAuth) && Boolean(authStore.isLoggedIn)
 })
 
 onMounted(async () => {
   // 初始化认证状态
   await authStore.initAuth()
-  
+
   // 异步初始化版本检查，不阻塞应用启动
   versionStore.initVersionCheck()
-  
+
   // 移除初始加载元素（如果存在）
   const appLoading = document.getElementById('app-loading')
   if (appLoading) {
@@ -61,6 +66,23 @@ html, body {
 #app {
   height: 100vh;
   overflow: hidden;
+}
+
+.route-guard-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  background: #f5f5f5;
+}
+
+.route-guard-spinner {
+  width: 32px;
+  height: 32px;
+  border: 3px solid rgba(64, 158, 255, 0.15);
+  border-top-color: #409eff;
+  border-radius: 50%;
+  animation: route-guard-spin 0.8s linear infinite;
 }
 
 /* 滚动条样式 */
@@ -157,6 +179,12 @@ html, body {
 
 .slide-right-leave-to {
   transform: translateX(-100%);
+}
+
+@keyframes route-guard-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* 移动端样式 */

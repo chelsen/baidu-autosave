@@ -5,50 +5,45 @@
         <h1 class="login-title">百度网盘自动转存工具</h1>
         <p class="login-subtitle">请登录您的账户</p>
       </div>
-      
-      <el-form
-        ref="loginFormRef"
-        :model="loginForm"
-        :rules="loginRules"
-        class="login-form"
-        @submit.prevent="handleLogin"
-      >
-        <el-form-item prop="username">
-          <el-input
+
+      <form class="login-form" @submit.prevent="handleLogin">
+        <div class="login-field">
+          <input
             v-model="loginForm.username"
+            name="username"
+            type="text"
+            autocomplete="username"
             placeholder="用户名"
-            size="large"
-            prefix-icon="User"
+            class="login-input"
             :disabled="loading"
           />
-        </el-form-item>
-        
-        <el-form-item prop="password">
-          <el-input
+        </div>
+
+        <div class="login-field">
+          <input
             v-model="loginForm.password"
+            name="current-password"
             type="password"
+            autocomplete="current-password"
             placeholder="密码"
-            size="large"
-            prefix-icon="Lock"
-            show-password
+            class="login-input"
             :disabled="loading"
-            @keyup.enter="handleLogin"
           />
-        </el-form-item>
-        
-        <el-form-item class="login-button-item">
+        </div>
+
+        <div class="login-button-item">
           <el-button
             type="primary"
             size="large"
             class="login-button"
             :loading="loading"
-            @click="handleLogin"
+            native-type="submit"
           >
             {{ loading ? '登录中...' : '登录' }}
           </el-button>
-        </el-form-item>
-      </el-form>
-      
+        </div>
+      </form>
+
       <div class="login-footer">
         <div class="version-info">
           <span>版本 {{ APP_VERSION }}</span>
@@ -61,7 +56,7 @@
 <script setup lang="ts">
 import { reactive, ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { ElMessage, type FormInstance } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
 import { APP_VERSION } from '@/config/version'
 
@@ -69,7 +64,6 @@ const router = useRouter()
 const route = useRoute()
 const authStore = useAuthStore()
 
-const loginFormRef = ref<FormInstance>()
 const loading = ref(false)
 
 // 表单数据
@@ -78,38 +72,30 @@ const loginForm = reactive({
   password: ''
 })
 
-// 表单验证规则
-const loginRules = {
-  username: [
-    { required: true, message: '请输入用户名', trigger: 'blur' }
-  ],
-  password: [
-    { required: true, message: '请输入密码', trigger: 'blur' },
-    { min: 6, message: '密码长度不能少于6位', trigger: 'blur' }
-  ]
-}
-
 // 处理登录
 const handleLogin = async () => {
-  if (!loginFormRef.value) return
-  
-  // 验证表单
-  const valid = await loginFormRef.value.validate().catch(() => false)
-  if (!valid) return
-  
+  if (!loginForm.username.trim()) {
+    ElMessage.warning('请输入用户名')
+    return
+  }
+  if (!loginForm.password) {
+    ElMessage.warning('请输入密码')
+    return
+  }
+  if (loginForm.password.length < 6) {
+    ElMessage.warning('密码长度不能少于6位')
+    return
+  }
+
   loading.value = true
-  
+
   try {
     await authStore.login(loginForm.username, loginForm.password)
-    
+
     ElMessage.success('登录成功')
-    
-    // 获取重定向地址
+
     const redirect = route.query.redirect as string
-    
-    // 跳转到目标页面或首页
     await router.push(redirect || '/')
-    
   } catch (error) {
     ElMessage.error(`登录失败: ${error}`)
   } finally {
@@ -171,12 +157,34 @@ const handleLogin = async () => {
   margin-bottom: 20px;
 }
 
-.login-form .el-form-item {
+.login-field {
   margin-bottom: 24px;
 }
 
+.login-input {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 14px;
+  font-size: 14px;
+  color: #303133;
+  background: #fff;
+  border: 1px solid #dcdfe6;
+  border-radius: 8px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.login-input:focus {
+  outline: none;
+  border-color: #409eff;
+  box-shadow: 0 0 0 2px rgba(64, 158, 255, 0.12);
+}
+
+.login-input::placeholder {
+  color: #a8abb2;
+}
+
 .login-button-item {
-  margin-bottom: 0 !important;
+  margin-bottom: 0;
 }
 
 .login-button {
@@ -198,42 +206,47 @@ const handleLogin = async () => {
   color: #999;
 }
 
-/* 响应式设计 */
 @media (max-width: 480px) {
   .login-container {
     padding: 16px;
   }
-  
+
   .login-card {
     padding: 30px 24px;
   }
-  
+
   .login-title {
     font-size: 20px;
   }
 }
 
-/* 深色模式支持 */
 @media (prefers-color-scheme: dark) {
   .login-card {
     background: #2d2d2d;
     color: #fff;
   }
-  
+
   .login-title {
     color: #fff;
   }
-  
-  .login-subtitle {
+
+  .login-subtitle,
+  .version-info {
     color: #ccc;
   }
-  
-  .login-footer {
-    border-top-color: #444;
+
+  .login-input {
+    color: #f5f7fa;
+    background: #1f1f1f;
+    border-color: #4c4d4f;
   }
-  
-  .version-info {
-    color: #888;
+
+  .login-input::placeholder {
+    color: #8d9095;
+  }
+
+  .login-footer {
+    border-top-color: #4c4d4f;
   }
 }
 </style>

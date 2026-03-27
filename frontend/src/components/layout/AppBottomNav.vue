@@ -16,11 +16,11 @@
             :hidden="false"
           >
             <el-icon size="20">
-              <component :is="iconComponents[item.icon]" />
+              <component :is="item.icon" />
             </el-icon>
           </el-badge>
           <el-icon v-else size="20">
-            <component :is="iconComponents[item.icon]" />
+            <component :is="item.icon" />
           </el-icon>
         </div>
         <span class="nav-label">{{ item.label }}</span>
@@ -41,7 +41,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, type Component } from 'vue'
 import { useRoute } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useTaskStore, useUserStore } from '@/stores'
@@ -53,14 +53,6 @@ interface Emits {
 }
 
 const emit = defineEmits<Emits>()
-
-// 注册图标组件以供动态使用
-const iconComponents = {
-  Odometer,
-  List,
-  User,
-  Setting
-}
 
 // Composables
 const route = useRoute()
@@ -75,29 +67,29 @@ const { userStats } = storeToRefs(userStore)
 const navItems = computed(() => [
   {
     path: '/dashboard',
-    icon: 'Odometer',
+    icon: Odometer,
     label: '首页',
     badge: 0
   },
   {
     path: '/tasks',
-    icon: 'List',
+    icon: List,
     label: '任务',
     badge: taskStats.value.running
   },
   {
     path: '/users',
-    icon: 'User',
+    icon: User,
     label: '用户',
     badge: userStats.value.invalid
   },
   {
     path: '/settings',
-    icon: 'Setting',
+    icon: Setting,
     label: '设置',
     badge: 0
   }
-])
+] satisfies Array<{ path: string; icon: Component; label: string; badge: number }>)
 
 // 方法
 const isActive = (path: string) => {
